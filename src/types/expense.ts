@@ -1,0 +1,79 @@
+export type CategoryId =
+  | 'food'
+  | 'transport'
+  | 'housing'
+  | 'utilities'
+  | 'shopping'
+  | 'entertainment'
+  | 'health'
+  | 'education'
+  | 'other';
+
+export interface CategoryInfo {
+  id: CategoryId;
+  name: string;
+  color: string;
+  bgLight: string;
+  bgDark: string;
+  textLight: string;
+  textDark: string;
+  icon: string;
+}
+
+export type IncomeCategoryId =
+  | 'salary'
+  | 'freelance'
+  | 'business'
+  | 'investment'
+  | 'side_hustle'
+  | 'gift_bonus'
+  | 'refund'
+  | 'other_income';
+
+export interface IncomeCategoryInfo {
+  id: IncomeCategoryId;
+  name: string;
+  color: string;
+  bgLight: string;
+  bgDark: string;
+  textLight: string;
+  textDark: string;
+  icon: string;
+}
+
+export type PaymentMethod = 'card' | 'cash' | 'digital' | 'bank_transfer' | 'check';
+
+export interface Expense {
+  id: string;
+  title: string;
+  amount: number;
+  category: CategoryId;
+  date: string; // ISO format: YYYY-MM-DD
+  time?: string; // HH:mm
+  paymentMethod?: PaymentMethod;
+  notes?: string;
+  createdAt: number;
+}
+
+export interface Income {
+  id: string;
+  title: string;
+  amount: number;
+  category: IncomeCategoryId;
+  date: string; // ISO format: YYYY-MM-DD
+  time?: string; // HH:mm
+  paymentMethod?: PaymentMethod;
+  notes?: string;
+  createdAt: number;
+}
+
+export interface BudgetConfig {
+  daily: number;
+  weekly: number;
+  monthly: number;
+  currency: string;
+  monthlySavingsTarget?: number;
+}
+
+export type DailySectionTab = 'expenses' | 'income' | 'both';
+export type PageTab = 'daily' | 'weekly-monthly' | 'charts' | 'budgets';

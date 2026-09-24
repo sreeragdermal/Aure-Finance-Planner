@@ -1,0 +1,6 @@
+{
+  "name": "Aura Finance - Personal Daily Expense & Income Tracker",
+  "description": "Minimal, user-friendly personal finance tracker with daily expense and daily income tracking in separate sections, automatic daily, weekly, monthly, and yearly calculations, charts, and dark mode.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

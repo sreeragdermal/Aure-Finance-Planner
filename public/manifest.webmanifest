@@ -1,0 +1,27 @@
+{
+  "id": "/",
+  "name": "Aura Finance - Daily Expense & Income Tracker",
+  "short_name": "AuraFinance",
+  "description": "Minimal, user-friendly personal finance tracker with daily expense and daily income tracking in separate sections, automatic daily, weekly, monthly, and yearly calculations, charts, and dark mode.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0F1117",
+  "theme_color": "#0F1117",
+  "categories": ["finance", "productivity", "utilities"],
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}

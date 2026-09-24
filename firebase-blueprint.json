@@ -1,0 +1,25 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User account tracking and activity for usage analytics",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "firstSeenAt": { "type": "string" },
+        "lastActiveAt": { "type": "string" },
+        "devicePlatform": { "type": "string" }
+      },
+      "required": ["uid", "firstSeenAt", "lastActiveAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User activity document"
+    }
+  }
+}
