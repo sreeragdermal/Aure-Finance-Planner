@@ -8,6 +8,69 @@ export interface DriveFile {
   shared?: boolean;
 }
 
+export class DriveAuthError extends Error {
+  isAuthError = true;
+  status: number;
+  constructor(message: string = 'Google Drive session expired or unauthorized.', status: number = 401) {
+    super(message);
+    this.name = 'DriveAuthError';
+    this.status = status;
+  }
+}
+
+export class DriveNetworkError extends Error {
+  isNetworkError = true;
+  constructor(message: string = 'Unable to reach Google Drive (network error or offline).') {
+    super(message);
+    this.name = 'DriveNetworkError';
+  }
+}
+
+/**
+ * Standard fetch wrapper for Google Drive APIs with robust error detection
+ */
+export async function driveRequest(
+  url: string,
+  token: string,
+  options: RequestInit = {}
+): Promise<Response> {
+  if (!token) {
+    throw new DriveAuthError('No Google Drive authorization token available.', 401);
+  }
+
+  try {
+    const res = await fetch(url, {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...options.headers,
+      },
+    });
+
+    if (res.status === 401 || res.status === 403) {
+      const errText = await res.text().catch(() => '');
+      throw new DriveAuthError(
+        `Google Drive authentication expired or unauthorized (${res.status}): ${errText}`,
+        res.status
+      );
+    }
+
+    return res;
+  } catch (err: any) {
+    if (err instanceof DriveAuthError || err?.isAuthError) {
+      throw err;
+    }
+    if (
+      err.name === 'TypeError' ||
+      err.message?.includes('Failed to fetch') ||
+      err.message?.includes('NetworkError')
+    ) {
+      throw new DriveNetworkError();
+    }
+    throw err;
+  }
+}
+
 const FOLDER_NAME = 'Aura Finance Ledger & Budgets';
 
 /**
@@ -20,17 +83,13 @@ export const findOrCreateAppFolder = async (
     `name = '${FOLDER_NAME}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`
   );
 
-  const searchRes = await fetch(
+  const searchRes = await driveRequest(
     `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,webViewLink)&spaces=drive`,
-    {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    }
+    token
   );
 
   if (!searchRes.ok) {
-    const err = await searchRes.text();
+    const err = await searchRes.text().catch(() => '');
     throw new Error(`Failed to search Google Drive folders: ${err}`);
   }
 
@@ -40,10 +99,9 @@ export const findOrCreateAppFolder = async (
   }
 
   // Create folder if not found
-  const createRes = await fetch('https://www.googleapis.com/drive/v3/files', {
+  const createRes = await driveRequest('https://www.googleapis.com/drive/v3/files', token, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
@@ -54,7 +112,7 @@ export const findOrCreateAppFolder = async (
   });
 
   if (!createRes.ok) {
-    const err = await createRes.text();
+    const err = await createRes.text().catch(() => '');
     throw new Error(`Failed to create Google Drive folder: ${err}`);
   }
 
@@ -93,12 +151,12 @@ export const uploadBackupToDrive = async (
     fileContent +
     closeDelimiter;
 
-  const res = await fetch(
+  const res = await driveRequest(
     'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,modifiedTime,size,webViewLink',
+    token,
     {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${token}`,
         'Content-Type': `multipart/related; boundary=${boundary}`,
       },
       body: multipartRequestBody,
@@ -106,7 +164,7 @@ export const uploadBackupToDrive = async (
   );
 
   if (!res.ok) {
-    const err = await res.text();
+    const err = await res.text().catch(() => '');
     throw new Error(`Failed to upload backup to Google Drive: ${err}`);
   }
 
@@ -127,13 +185,9 @@ export const findOrCreateMasterLedgerFile = async (
     `name = '${MASTER_LEDGER_FILENAME}' and '${folder.id}' in parents and trashed = false`
   );
 
-  const searchRes = await fetch(
+  const searchRes = await driveRequest(
     `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,mimeType,modifiedTime,size,webViewLink)&spaces=drive`,
-    {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    }
+    token
   );
 
   if (searchRes.ok) {
@@ -157,12 +211,12 @@ export const updateDriveFileContent = async (
 ): Promise<DriveFile> => {
   const fileContent = JSON.stringify(content, null, 2);
 
-  const res = await fetch(
+  const res = await driveRequest(
     `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&fields=id,name,mimeType,modifiedTime,size,webViewLink`,
+    token,
     {
       method: 'PATCH',
       headers: {
-        Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
       body: fileContent,
@@ -170,7 +224,7 @@ export const updateDriveFileContent = async (
   );
 
   if (!res.ok) {
-    const err = await res.text();
+    const err = await res.text().catch(() => '');
     throw new Error(`Failed to auto-update file in Google Drive: ${err}`);
   }
 
@@ -208,12 +262,12 @@ export const uploadCsvToDrive = async (
     csvContent +
     closeDelimiter;
 
-  const res = await fetch(
+  const res = await driveRequest(
     'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,modifiedTime,size,webViewLink',
+    token,
     {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${token}`,
         'Content-Type': `multipart/related; boundary=${boundary}`,
       },
       body: multipartRequestBody,
@@ -221,7 +275,7 @@ export const uploadCsvToDrive = async (
   );
 
   if (!res.ok) {
-    const err = await res.text();
+    const err = await res.text().catch(() => '');
     throw new Error(`Failed to upload CSV to Google Drive: ${err}`);
   }
 
@@ -235,17 +289,13 @@ export const listDriveBackups = async (token: string): Promise<DriveFile[]> => {
   const folder = await findOrCreateAppFolder(token);
   const query = encodeURIComponent(`'${folder.id}' in parents and trashed = false`);
 
-  const res = await fetch(
+  const res = await driveRequest(
     `https://www.googleapis.com/drive/v3/files?q=${query}&orderBy=modifiedTime desc&fields=files(id,name,mimeType,modifiedTime,size,webViewLink,shared)&pageSize=30`,
-    {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    }
+    token
   );
 
   if (!res.ok) {
-    const err = await res.text();
+    const err = await res.text().catch(() => '');
     throw new Error(`Failed to list files from Google Drive: ${err}`);
   }
 
@@ -257,14 +307,13 @@ export const listDriveBackups = async (token: string): Promise<DriveFile[]> => {
  * Download file content from Google Drive by file ID
  */
 export const downloadDriveFile = async (token: string, fileId: string): Promise<any> => {
-  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-    },
-  });
+  const res = await driveRequest(
+    `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+    token
+  );
 
   if (!res.ok) {
-    const err = await res.text();
+    const err = await res.text().catch(() => '');
     throw new Error(`Failed to download file from Google Drive: ${err}`);
   }
 
@@ -280,12 +329,12 @@ export const shareDriveItem = async (
   emailAddress: string,
   role: 'reader' | 'writer' = 'reader'
 ): Promise<void> => {
-  const res = await fetch(
+  const res = await driveRequest(
     `https://www.googleapis.com/drive/v3/files/${fileOrFolderId}/permissions?sendNotificationEmail=true`,
+    token,
     {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -297,7 +346,7 @@ export const shareDriveItem = async (
   );
 
   if (!res.ok) {
-    const err = await res.text();
+    const err = await res.text().catch(() => '');
     throw new Error(`Failed to share Google Drive item with ${emailAddress}: ${err}`);
   }
 };
@@ -306,15 +355,16 @@ export const shareDriveItem = async (
  * Delete a backup file from Google Drive (Mandatory user confirmation handled by caller)
  */
 export const deleteDriveFile = async (token: string, fileId: string): Promise<void> => {
-  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
-    method: 'DELETE',
-    headers: {
-      Authorization: `Bearer ${token}`,
-    },
-  });
+  const res = await driveRequest(
+    `https://www.googleapis.com/drive/v3/files/${fileId}`,
+    token,
+    {
+      method: 'DELETE',
+    }
+  );
 
   if (!res.ok && res.status !== 204) {
-    const err = await res.text();
+    const err = await res.text().catch(() => '');
     throw new Error(`Failed to delete file from Google Drive: ${err}`);
   }
 };

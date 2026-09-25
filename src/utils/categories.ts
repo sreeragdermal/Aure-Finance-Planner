@@ -186,13 +186,13 @@ export const INCOME_CATEGORIES: Record<IncomeCategoryId, IncomeCategoryInfo> = {
 
 export const INCOME_CATEGORY_LIST = Object.values(INCOME_CATEGORIES);
 
-// Indian Rupee (₹) Presets
+// Rupee (₹) and global presets
 export const PRESET_EXPENSES = [
   { title: 'Chai & Snacks', amount: 30, category: 'food' as CategoryId },
   { title: 'Lunch / Thali', amount: 150, category: 'food' as CategoryId },
-  { title: 'Groceries / Kirana', amount: 750, category: 'shopping' as CategoryId },
-  { title: 'Metro / Auto / Petrol', amount: 80, category: 'transport' as CategoryId },
-  { title: 'Mobile / Wifi Recharge', amount: 399, category: 'utilities' as CategoryId },
+  { title: 'Groceries', amount: 750, category: 'shopping' as CategoryId },
+  { title: 'Metro / Auto', amount: 80, category: 'transport' as CategoryId },
+  { title: 'Mobile / WiFi', amount: 399, category: 'utilities' as CategoryId },
 ];
 
 export const PRESET_INCOMES = [

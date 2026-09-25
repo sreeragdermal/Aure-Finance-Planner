@@ -45,7 +45,12 @@ export const GoogleDriveSyncSection: React.FC = () => {
     refreshBackups,
   } = useGoogleDrive();
 
-  const { expenses, incomes, budget, importAllData } = useExpenses();
+  const {
+    expenses,
+    incomes,
+    budget,
+    importAllData,
+  } = useExpenses();
 
   // Dialog states
   const [shareEmail, setShareEmail] = useState('');
@@ -180,14 +185,14 @@ export const GoogleDriveSyncSection: React.FC = () => {
           <div>
             <div className="flex items-center gap-2">
               <h3 className="text-sm font-semibold text-neutral-900 dark:text-white">
-                Google Drive Storage & Multi-Person Access
+                Cloud Sync
               </h3>
-              <span className="px-2 py-0.5 text-[10px] font-medium rounded-full bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
-                100% Private Cloud
+              <span className="px-2 py-0.5 text-[10px] font-medium rounded-full bg-emerald-50 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
+                Connected
               </span>
             </div>
             <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-0.5">
-              Sync your ledger directly to your personal Google Drive and share files with family or team members via Gmail.
+              Keep your Aura Finance data synchronized across your devices.
             </p>
           </div>
         </div>
@@ -241,7 +246,7 @@ export const GoogleDriveSyncSection: React.FC = () => {
                   </span>
                   <span className="inline-flex items-center gap-0.5 text-[9px] text-emerald-600 dark:text-emerald-400 font-semibold">
                     <Check className="w-2.5 h-2.5" />
-                    Remembered
+                    Connected
                   </span>
                 </div>
                 <div className="text-[10px] text-neutral-500 dark:text-neutral-400 truncate max-w-[120px] sm:max-w-[150px]">
@@ -563,11 +568,11 @@ export const GoogleDriveSyncSection: React.FC = () => {
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div className="space-y-1">
               <div className="text-sm font-semibold text-neutral-900 dark:text-white flex items-center gap-1.5">
-                <ShieldCheck className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-                <span>Sign in to Activate Cloud Facilities</span>
+                <Cloud className="w-4 h-4 text-neutral-700 dark:text-neutral-300" />
+                <span>Cloud Sync</span>
               </div>
               <p className="text-xs text-neutral-600 dark:text-neutral-400 max-w-xl">
-                Connect with your Google account to automatically store your ledger in your private Google Drive folder, invite family members via Gmail, and stay remembered across visits.
+                Your data is currently stored on this device. Sign in with Google to securely sync your financial records across your devices.
               </p>
             </div>
 

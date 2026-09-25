@@ -7,10 +7,11 @@ export type CategoryId =
   | 'entertainment'
   | 'health'
   | 'education'
-  | 'other';
+  | 'other'
+  | (string & {});
 
 export interface CategoryInfo {
-  id: CategoryId;
+  id: string;
   name: string;
   color: string;
   bgLight: string;
@@ -18,6 +19,7 @@ export interface CategoryInfo {
   textLight: string;
   textDark: string;
   icon: string;
+  isCustom?: boolean;
 }
 
 export type IncomeCategoryId =
@@ -73,7 +75,18 @@ export interface BudgetConfig {
   monthly: number;
   currency: string;
   monthlySavingsTarget?: number;
+  dateFormat?: 'DD/MM/YYYY' | 'MM/DD/YYYY' | 'YYYY-MM-DD';
+  weekStartsOn?: 'Monday' | 'Sunday';
 }
 
 export type DailySectionTab = 'expenses' | 'income' | 'both';
-export type PageTab = 'daily' | 'weekly-monthly' | 'charts' | 'budgets';
+export type PageTab =
+  | 'dashboard'
+  | 'daily'
+  | 'weekly-monthly'
+  | 'charts'
+  | 'budgets'
+  | 'budget-limits'
+  | 'categories'
+  | 'backup';
+

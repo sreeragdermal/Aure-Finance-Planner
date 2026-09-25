@@ -9,6 +9,7 @@ import {
   PAYMENT_METHOD_LABELS,
 } from '../utils/categories';
 import { toDateString } from '../utils/calculations';
+import { playIncomeSuccessSound, playExpenseSuccessSound } from '../utils/soundEffects';
 import {
   X,
   CreditCard,
@@ -32,7 +33,7 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
   onClose,
   defaultDate,
 }) => {
-  const { addExpense, addIncome, budget, modalType } = useExpenses();
+  const { addExpense, addIncome, budget, modalType, categoryList } = useExpenses();
 
   const [entryType, setEntryType] = useState<'expense' | 'income'>('expense');
   const [title, setTitle] = useState('');
@@ -80,6 +81,7 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
         paymentMethod,
         notes: notes.trim() || undefined,
       });
+      playExpenseSuccessSound();
     } else {
       addIncome({
         title: title.trim(),
@@ -90,6 +92,7 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
         paymentMethod,
         notes: notes.trim() || undefined,
       });
+      playIncomeSuccessSound();
     }
 
     onClose();
@@ -266,7 +269,7 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
             </label>
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
               {entryType === 'expense'
-                ? CATEGORY_LIST.map((cat) => {
+                ? categoryList.map((cat) => {
                     const isSelected = expenseCategory === cat.id;
                     return (
                       <button

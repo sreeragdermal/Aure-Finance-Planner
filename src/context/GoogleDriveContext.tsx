@@ -6,6 +6,7 @@ import {
   logoutGoogle,
   getAccessToken,
   setCachedAccessToken,
+  auth,
 } from '../services/googleAuth';
 import {
   findOrCreateAppFolder,
@@ -18,6 +19,8 @@ import {
   shareDriveItem,
   deleteDriveFile,
   DriveFile,
+  DriveAuthError,
+  DriveNetworkError,
 } from '../services/googleDrive';
 import { Expense, Income, BudgetConfig } from '../types/expense';
 
@@ -31,6 +34,8 @@ interface GoogleDriveContextType {
   user: User | null;
   token: string | null;
   isConnected: boolean;
+  isUserSignedIn: boolean;
+  isDriveConnected: boolean;
   isConnecting: boolean;
   isAutoSyncing: boolean;
   autoSyncEnabled: boolean;
@@ -70,11 +75,10 @@ const GoogleDriveContext = createContext<GoogleDriveContextType | undefined>(und
 const STORAGE_KEY_LAST_SYNC = 'aura_drive_last_sync';
 const STORAGE_KEY_AUTO_SYNC = 'aura_drive_auto_sync_enabled';
 const STORAGE_KEY_REMEMBERED_ACCOUNT = 'aura_remembered_account';
-const STORAGE_KEY_MODAL_DISMISSED = 'aura_signin_modal_dismissed';
 
 export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [user, setUser] = useState<User | null>(null);
-  const [token, setToken] = useState<string | null>(null);
+  const [user, setUser] = useState<User | null>(() => auth.currentUser);
+  const [token, setToken] = useState<string | null>(() => getAccessToken());
   const [isConnecting, setIsConnecting] = useState(false);
   const [isAutoSyncing, setIsAutoSyncing] = useState(false);
   const [autoSyncEnabled, setAutoSyncEnabled] = useState<boolean>(() => {
@@ -107,15 +111,12 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }
   });
 
-  // Prompt sign-in modal if not logged in
-  const [isSignInModalOpen, setIsSignInModalOpen] = useState<boolean>(() => {
-    return false; // Will trigger dynamically in useEffect if unauthenticated
-  });
+  // Sign-in modal - NEVER auto-opens on visit; only opens when user explicitly clicks Sign In
+  const [isSignInModalOpen, setIsSignInModalOpen] = useState<boolean>(false);
 
   const openSignInModal = () => setIsSignInModalOpen(true);
   const closeSignInModal = () => {
     setIsSignInModalOpen(false);
-    sessionStorage.setItem(STORAGE_KEY_MODAL_DISMISSED, 'true');
   };
 
   const debounceTimerRef = useRef<any>(null);
@@ -139,8 +140,9 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, 4500);
   };
 
-  // Fetch folder and files once authenticated
-  const loadDriveData = useCallback(async (authToken: string) => {
+  // Fetch folder and files once authenticated with graceful error handling
+  const loadDriveData = useCallback(async (authToken: string, isUserInitiated: boolean = false) => {
+    if (!authToken) return;
     setIsLoadingBackups(true);
     try {
       const folder = await findOrCreateAppFolder(authToken);
@@ -149,19 +151,48 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
       const files = await listDriveBackups(authToken);
       setBackups(files);
     } catch (err: any) {
-      console.error('Error loading Google Drive data:', err);
-      showStatus(err.message || 'Error connecting to Google Drive', 'error');
+      const isAuthOrNetwork =
+        err instanceof DriveAuthError ||
+        err instanceof DriveNetworkError ||
+        err?.isAuthError ||
+        err?.isNetworkError ||
+        err?.status === 401 ||
+        err?.status === 403 ||
+        err?.message?.includes('Failed to fetch') ||
+        err?.message?.includes('expired') ||
+        err?.message?.includes('unauthorized');
+
+      if (isAuthOrNetwork) {
+        // Silently clear expired or invalid token
+        setCachedAccessToken(null);
+        setToken(null);
+        setFolderInfo(null);
+        setMasterFileId(null);
+        console.warn('Google Drive session inactive or offline. Waiting for user authentication.');
+        if (isUserInitiated) {
+          showStatus('Google Drive session expired. Please sign in again to connect.', 'info');
+        }
+      } else {
+        console.warn('Google Drive notice:', err?.message || err);
+        if (isUserInitiated) {
+          showStatus(err.message || 'Error connecting to Google Drive', 'error');
+        }
+      }
     } finally {
       setIsLoadingBackups(false);
     }
   }, []);
 
-  // Listen to Firebase Auth state
+  // Listen to Firebase Auth state - silently restore session without popups
   useEffect(() => {
-    let checked = false;
+    const currentUser = auth.currentUser;
+    const initialToken = getAccessToken(currentUser?.uid);
+    if (initialToken && currentUser) {
+      loadDriveData(initialToken, false);
+    }
+
     const unsubscribe = initAuth(
       (authUser, authToken) => {
-        checked = true;
         setUser(authUser);
         if (authUser) {
           const profile = {
@@ -173,32 +204,25 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
           localStorage.setItem(STORAGE_KEY_REMEMBERED_ACCOUNT, JSON.stringify(profile));
         }
 
-        if (authToken) {
+        if (authToken && authUser) {
           setToken(authToken);
-          loadDriveData(authToken);
-          setIsSignInModalOpen(false);
+          loadDriveData(authToken, false);
+        } else {
+          setToken(null);
         }
+        // Ensure modal is closed once user is logged in
+        setIsSignInModalOpen(false);
       },
       () => {
-        checked = true;
         setUser(null);
         setToken(null);
         setFolderInfo(null);
         setBackups([]);
-        // Prompt sign-in modal for newcomers
-        setIsSignInModalOpen(true);
       }
     );
 
-    const timer = setTimeout(() => {
-      if (!checked && !user) {
-        setIsSignInModalOpen(true);
-      }
-    }, 1000);
-
     return () => {
       unsubscribe();
-      clearTimeout(timer);
     };
   }, [loadDriveData]);
 
@@ -219,7 +243,7 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
         localStorage.setItem(STORAGE_KEY_REMEMBERED_ACCOUNT, JSON.stringify(profile));
         setIsSignInModalOpen(false);
         showStatus(`Connected to Google Drive as ${res.user.email}`, 'success');
-        await loadDriveData(res.accessToken);
+        await loadDriveData(res.accessToken, true);
         return true;
       }
       return false;
@@ -242,7 +266,7 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
       setBackups([]);
       localStorage.removeItem(STORAGE_KEY_REMEMBERED_ACCOUNT);
       setRememberedAccount(null);
-      setIsSignInModalOpen(true);
+      setIsSignInModalOpen(false);
       showStatus('Disconnected from Google Drive', 'info');
     } catch (err: any) {
       console.error('Logout error:', err);
@@ -255,7 +279,7 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
     incomes: Income[];
     budget: BudgetConfig;
   }): Promise<boolean> => {
-    const currentToken = token || getAccessToken();
+    const currentToken = token || getAccessToken(user?.uid);
     if (!currentToken) {
       showStatus('Please connect Google Drive first', 'error');
       return false;
@@ -283,15 +307,23 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
       showStatus(`Saved "${file.name}" to your Google Drive!`, 'success');
       return true;
     } catch (err: any) {
-      console.error('Drive save error:', err);
-      showStatus(err.message || 'Failed to save to Google Drive', 'error');
+      if (err instanceof DriveAuthError || err?.isAuthError) {
+        setCachedAccessToken(null);
+        setToken(null);
+        showStatus('Google Drive session expired. Please sign in again to save.', 'error');
+      } else if (err instanceof DriveNetworkError || err?.isNetworkError) {
+        showStatus('Network error: Unable to reach Google Drive.', 'error');
+      } else {
+        console.error('Drive save error:', err);
+        showStatus(err.message || 'Failed to save to Google Drive', 'error');
+      }
       return false;
     }
   };
 
   // Save CSV Spreadsheet to Google Drive
   const saveCsvToDrive = async (csvContent: string): Promise<boolean> => {
-    const currentToken = token || getAccessToken();
+    const currentToken = token || getAccessToken(user?.uid);
     if (!currentToken) {
       showStatus('Please connect Google Drive first', 'error');
       return false;
@@ -305,8 +337,16 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
       showStatus(`Spreadsheet "${file.name}" created in Google Drive!`, 'success');
       return true;
     } catch (err: any) {
-      console.error('Drive CSV save error:', err);
-      showStatus(err.message || 'Failed to save spreadsheet to Google Drive', 'error');
+      if (err instanceof DriveAuthError || err?.isAuthError) {
+        setCachedAccessToken(null);
+        setToken(null);
+        showStatus('Google Drive session expired. Please sign in again to save.', 'error');
+      } else if (err instanceof DriveNetworkError || err?.isNetworkError) {
+        showStatus('Network error: Unable to reach Google Drive.', 'error');
+      } else {
+        console.error('Drive CSV save error:', err);
+        showStatus(err.message || 'Failed to save spreadsheet to Google Drive', 'error');
+      }
       return false;
     }
   };
@@ -315,7 +355,7 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
   const loadBackupFromDrive = async (
     fileId: string
   ): Promise<{ expenses?: Expense[]; incomes?: Income[]; budget?: BudgetConfig } | null> => {
-    const currentToken = token || getAccessToken();
+    const currentToken = token || getAccessToken(user?.uid);
     if (!currentToken) {
       showStatus('Please connect Google Drive first', 'error');
       return null;
@@ -327,8 +367,16 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
       showStatus('Backup downloaded successfully', 'success');
       return data;
     } catch (err: any) {
-      console.error('Drive download error:', err);
-      showStatus(err.message || 'Failed to download from Google Drive', 'error');
+      if (err instanceof DriveAuthError || err?.isAuthError) {
+        setCachedAccessToken(null);
+        setToken(null);
+        showStatus('Google Drive session expired. Please sign in again to download.', 'error');
+      } else if (err instanceof DriveNetworkError || err?.isNetworkError) {
+        showStatus('Network error: Unable to reach Google Drive.', 'error');
+      } else {
+        console.error('Drive download error:', err);
+        showStatus(err.message || 'Failed to download from Google Drive', 'error');
+      }
       return null;
     }
   };
@@ -338,7 +386,7 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
     email: string,
     role: 'reader' | 'writer' = 'reader'
   ): Promise<boolean> => {
-    const currentToken = token || getAccessToken();
+    const currentToken = token || getAccessToken(user?.uid);
     if (!currentToken) {
       showStatus('Please connect Google Drive first', 'error');
       return false;
@@ -355,15 +403,21 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
       showStatus(`Shared with ${email}! They can now view or access your ledger files in Drive.`, 'success');
       return true;
     } catch (err: any) {
-      console.error('Drive share error:', err);
-      showStatus(err.message || 'Failed to share folder in Google Drive', 'error');
+      if (err instanceof DriveAuthError || err?.isAuthError) {
+        setCachedAccessToken(null);
+        setToken(null);
+        showStatus('Google Drive session expired. Please sign in again to share.', 'error');
+      } else {
+        console.error('Drive share error:', err);
+        showStatus(err.message || 'Failed to share folder in Google Drive', 'error');
+      }
       return false;
     }
   };
 
   // Delete a backup from Drive
   const deleteBackup = async (fileId: string): Promise<boolean> => {
-    const currentToken = token || getAccessToken();
+    const currentToken = token || getAccessToken(user?.uid);
     if (!currentToken) return false;
 
     try {
@@ -372,8 +426,14 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
       showStatus('Backup removed from Google Drive', 'info');
       return true;
     } catch (err: any) {
-      console.error('Drive delete error:', err);
-      showStatus(err.message || 'Failed to delete backup', 'error');
+      if (err instanceof DriveAuthError || err?.isAuthError) {
+        setCachedAccessToken(null);
+        setToken(null);
+        showStatus('Google Drive session expired.', 'error');
+      } else {
+        console.error('Drive delete error:', err);
+        showStatus(err.message || 'Failed to delete backup', 'error');
+      }
       return false;
     }
   };
@@ -381,7 +441,7 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
   // Continuous Auto-Sync when records change
   const triggerAutoSync = useCallback(
     (data: { expenses: Expense[]; incomes: Income[]; budget: BudgetConfig }) => {
-      const currentToken = token || getAccessToken();
+      const currentToken = token || getAccessToken(user?.uid);
       if (!currentToken || !autoSyncEnabled) return;
 
       if (debounceTimerRef.current) {
@@ -413,19 +473,23 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
           setLastSyncTime(nowStr);
           localStorage.setItem(STORAGE_KEY_LAST_SYNC, nowStr);
         } catch (err: any) {
-          console.warn('Background auto-sync to Drive failed, will retry on next edit:', err);
+          if (err instanceof DriveAuthError || err?.isAuthError) {
+            setCachedAccessToken(null);
+            setToken(null);
+          }
+          console.warn('Background auto-sync to Drive paused:', err?.message || err);
         } finally {
           setIsAutoSyncing(false);
         }
       }, 1600);
     },
-    [token, autoSyncEnabled, masterFileId, user?.email]
+    [token, autoSyncEnabled, masterFileId, user?.email, user?.uid]
   );
 
   const refreshBackups = async () => {
-    const currentToken = token || getAccessToken();
+    const currentToken = token || getAccessToken(user?.uid);
     if (currentToken) {
-      await loadDriveData(currentToken);
+      await loadDriveData(currentToken, true);
     }
   };
 
@@ -435,6 +499,8 @@ export const GoogleDriveProvider: React.FC<{ children: React.ReactNode }> = ({ c
         user,
         token,
         isConnected: Boolean(user && token),
+        isUserSignedIn: Boolean(user || rememberedAccount),
+        isDriveConnected: Boolean(user && token),
         isConnecting,
         isAutoSyncing,
         autoSyncEnabled,

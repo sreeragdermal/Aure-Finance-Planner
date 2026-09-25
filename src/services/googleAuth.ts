@@ -6,8 +6,11 @@ import {
   onAuthStateChanged,
   signOut,
   User,
+  setPersistence,
+  browserLocalPersistence,
 } from 'firebase/auth';
 import {
+  initializeFirestore,
   getFirestore,
   doc,
   setDoc,
@@ -20,7 +23,81 @@ import firebaseConfig from '../../firebase-applet-config.json';
 // Initialize Firebase App singleton
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 export const auth = getAuth(app);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+
+// Guarantee persistent login across app visits and browser restarts
+if (typeof window !== 'undefined') {
+  setPersistence(auth, browserLocalPersistence).catch((err) => {
+    console.warn('Auth persistence notice:', err);
+  });
+}
+
+// Initialize Firestore with auto-detect long polling enabled to handle proxy, sandbox and iframe networks
+export const db = initializeFirestore(
+  app,
+  {
+    experimentalAutoDetectLongPolling: true,
+  },
+  firebaseConfig.firestoreDatabaseId
+);
+
+// Connection test helper that gracefully handles offline mode without throwing unavailable errors
+export async function testConnection() {
+  try {
+    await getDoc(doc(db, 'test', 'connection'));
+  } catch (error) {
+    // Expected in offline/disconnected mode - Firestore will queue operations until online
+    console.debug('Firestore connection check (client in offline/queued state):', error);
+  }
+}
+
+// Skill-standard error handler
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  };
+}
+
+export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo:
+        auth.currentUser?.providerData?.map((provider) => ({
+          providerId: provider.providerId,
+          email: provider.email,
+        })) || [],
+    },
+    operationType,
+    path,
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
 
 // Configure Google Provider with required Drive scopes
 export const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
@@ -28,7 +105,12 @@ export const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 const provider = new GoogleAuthProvider();
 provider.addScope(DRIVE_SCOPE);
 
-// In-memory token cache (never stored in localStorage as per security guidelines)
+// Persistent token cache keys
+const STORAGE_KEY_TOKEN = 'aura_gdrive_access_token_v2';
+const STORAGE_KEY_TOKEN_EXPIRY = 'aura_gdrive_token_expiry_v2';
+const STORAGE_KEY_TOKEN_UID = 'aura_gdrive_token_uid_v2';
+const TOKEN_MAX_AGE_MS = 55 * 60 * 1000; // 55 minutes
+
 let cachedAccessToken: string | null = null;
 let isSigningIn = false;
 
@@ -50,9 +132,10 @@ export const recordUserVisit = async (user: User) => {
     const userRef = doc(db, 'users', user.uid);
     const snap = await getDoc(userRef);
     const now = new Date().toISOString();
-    const platform = typeof navigator !== 'undefined' && /Mobi|Android|iPhone/i.test(navigator.userAgent)
-      ? 'Mobile'
-      : 'Desktop';
+    const platform =
+      typeof navigator !== 'undefined' && /Mobi|Android|iPhone/i.test(navigator.userAgent)
+        ? 'Mobile'
+        : 'Desktop';
 
     if (!snap.exists()) {
       await setDoc(userRef, {
@@ -105,7 +188,63 @@ export const fetchAppUsersMetrics = async (): Promise<{
 };
 
 /**
- * Initialize Auth state listener
+ * Get access token from memory or valid localStorage cache
+ */
+export const getAccessToken = (currentUserUid?: string): string | null => {
+  if (cachedAccessToken) {
+    return cachedAccessToken;
+  }
+  if (typeof window !== 'undefined') {
+    try {
+      const storedToken = localStorage.getItem(STORAGE_KEY_TOKEN);
+      const storedExpiry = localStorage.getItem(STORAGE_KEY_TOKEN_EXPIRY);
+      const storedUid = localStorage.getItem(STORAGE_KEY_TOKEN_UID);
+
+      if (storedToken && storedExpiry) {
+        const expiry = Number(storedExpiry);
+        const isUidMatch = !currentUserUid || !storedUid || storedUid === currentUserUid;
+        if (Date.now() < expiry && isUidMatch) {
+          cachedAccessToken = storedToken;
+          return storedToken;
+        } else {
+          // Immediately purge expired/mismatched token
+          cachedAccessToken = null;
+          localStorage.removeItem(STORAGE_KEY_TOKEN);
+          localStorage.removeItem(STORAGE_KEY_TOKEN_EXPIRY);
+          localStorage.removeItem(STORAGE_KEY_TOKEN_UID);
+        }
+      }
+    } catch (err) {
+      console.warn('Could not read stored access token:', err);
+    }
+  }
+  return null;
+};
+
+/**
+ * Set cached access token in memory and localStorage
+ */
+export const setCachedAccessToken = (token: string | null, uid?: string) => {
+  cachedAccessToken = token;
+  if (typeof window !== 'undefined') {
+    try {
+      if (token) {
+        localStorage.setItem(STORAGE_KEY_TOKEN, token);
+        localStorage.setItem(STORAGE_KEY_TOKEN_EXPIRY, String(Date.now() + TOKEN_MAX_AGE_MS));
+        if (uid) localStorage.setItem(STORAGE_KEY_TOKEN_UID, uid);
+      } else {
+        localStorage.removeItem(STORAGE_KEY_TOKEN);
+        localStorage.removeItem(STORAGE_KEY_TOKEN_EXPIRY);
+        localStorage.removeItem(STORAGE_KEY_TOKEN_UID);
+      }
+    } catch (err) {
+      console.warn('Could not update stored access token:', err);
+    }
+  }
+};
+
+/**
+ * Initialize Auth state listener - restores session seamlessly on refresh
  */
 export const initAuth = (
   onAuthSuccess?: (user: User, token: string | null) => void,
@@ -115,9 +254,10 @@ export const initAuth = (
     if (user) {
       // Record user presence in Firestore
       recordUserVisit(user);
-      if (onAuthSuccess) onAuthSuccess(user, cachedAccessToken);
+      const token = getAccessToken(user.uid);
+      if (onAuthSuccess) onAuthSuccess(user, token);
     } else {
-      cachedAccessToken = null;
+      setCachedAccessToken(null);
       if (onAuthFailure) onAuthFailure();
     }
   });
@@ -131,15 +271,12 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
     isSigningIn = true;
     const result = await signInWithPopup(auth, provider);
     const credential = GoogleAuthProvider.credentialFromResult(result);
+    const accessToken = credential?.accessToken || null;
 
-    if (!credential?.accessToken) {
-      throw new Error('Could not retrieve Google Drive access token from authentication.');
-    }
-
-    cachedAccessToken = credential.accessToken;
+    setCachedAccessToken(accessToken, result.user.uid);
     // Record in Firestore
     await recordUserVisit(result.user);
-    return { user: result.user, accessToken: cachedAccessToken };
+    return { user: result.user, accessToken: accessToken || '' };
   } catch (error: any) {
     if (error.code === 'auth/popup-closed-by-user') {
       console.log('Google sign-in popup closed by user.');
@@ -157,23 +294,13 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
 };
 
 /**
- * Get current in-memory cached access token
- */
-export const getAccessToken = (): string | null => {
-  return cachedAccessToken;
-};
-
-/**
- * Set cached access token manually
- */
-export const setCachedAccessToken = (token: string | null) => {
-  cachedAccessToken = token;
-};
-
-/**
  * Logout and clear cached token
  */
 export const logoutGoogle = async () => {
-  await signOut(auth);
-  cachedAccessToken = null;
+  try {
+    await signOut(auth);
+  } catch (err) {
+    console.warn('Sign out error:', err);
+  }
+  setCachedAccessToken(null);
 };

@@ -14,12 +14,33 @@
         "devicePlatform": { "type": "string" }
       },
       "required": ["uid", "firstSeenAt", "lastActiveAt"]
+    },
+    "LedgerData": {
+      "title": "LedgerData",
+      "description": "User's synchronized personal financial ledger (expenses, incomes, and budget settings) for cross-device real-time sync",
+      "type": "object",
+      "properties": {
+        "expenses": { "type": "array" },
+        "incomes": { "type": "array" },
+        "budget": { "type": "object" },
+        "updatedAt": { "type": "string" },
+        "lastDevice": { "type": "string" }
+      },
+      "required": ["updatedAt"]
     }
   },
   "firestore": {
     "/users/{userId}": {
       "schema": "User",
       "description": "User activity document"
+    },
+    "/users/{userId}/ledger/{document}": {
+      "schema": "LedgerData",
+      "description": "User's real-time financial ledger synchronizing across web and mobile"
+    },
+    "/accounts/{accountKey}/ledger/{document}": {
+      "schema": "LedgerData",
+      "description": "Unified 1-Email = 1-Account financial ledger synchronized across Computer Web and Mobile Web"
     }
   }
 }
