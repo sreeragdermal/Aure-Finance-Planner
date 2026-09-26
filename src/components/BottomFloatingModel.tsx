@@ -10,8 +10,21 @@ export const BottomFloatingModel: React.FC = () => {
   const [isRendered, setIsRendered] = useState(false);
   const [isAnimatingIn, setIsAnimatingIn] = useState(false);
 
+  const [isMobile, setIsMobile] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return window.innerWidth < 640;
+  });
+
   const closeTimerRef = useRef<number | null>(null);
   const openTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const handleResize = () => {
+      setIsMobile(window.innerWidth < 640);
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   const prefersReducedMotion = useMemo(() => {
     if (typeof window === 'undefined') return false;
@@ -95,7 +108,7 @@ export const BottomFloatingModel: React.FC = () => {
 
           <div
             onClick={(e) => e.stopPropagation()}
-            className="relative w-full sm:max-w-[440px] bg-white dark:bg-[#161922] border border-[#E7E7E3] dark:border-[#262B35] shadow-[0_20px_50px_-12px_rgba(0,0,0,0.22)] dark:shadow-[0_24px_50px_-12px_rgba(0,0,0,0.7)] p-4 sm:p-5 rounded-t-[22px] rounded-b-none sm:rounded-[22px] overflow-hidden"
+            className="relative w-full max-w-[520px] sm:max-w-[460px] bg-white dark:bg-[#161922] border border-[#E7E7E3] dark:border-[#262B35] shadow-[0_20px_50px_-12px_rgba(0,0,0,0.22)] dark:shadow-[0_24px_50px_-12px_rgba(0,0,0,0.7)] p-4 sm:p-5 rounded-t-[22px] rounded-b-none sm:rounded-[22px] overflow-hidden"
             style={{
               paddingBottom: 'max(1.25rem, calc(env(safe-area-inset-bottom, 0px) + 0.85rem))',
               opacity: isAnimatingIn ? 1 : 0,
@@ -103,11 +116,13 @@ export const BottomFloatingModel: React.FC = () => {
                 ? 'none'
                 : isAnimatingIn
                 ? 'translateY(0) scale(1)'
+                : isMobile
+                ? 'translateY(100%) scale(0.99)'
                 : 'translateY(18px) scale(0.97)',
               transition: prefersReducedMotion
                 ? 'opacity 180ms ease'
                 : `opacity ${isAnimatingIn ? '380ms' : '220ms'} ${EASING}, transform ${
-                    isAnimatingIn ? '380ms' : '220ms'
+                    isAnimatingIn ? (isMobile ? '400ms' : '360ms') : (isMobile ? '240ms' : '220ms')
                   } ${EASING}`,
               willChange: 'transform, opacity',
             }}

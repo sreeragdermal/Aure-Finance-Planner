@@ -14,26 +14,28 @@ import {
   PageTab,
   DailySectionTab,
   CategoryInfo,
+  TransactionDoc,
 } from '../types/expense';
 import { CATEGORIES } from '../utils/categories';
 import { getInitialSampleExpenses, getInitialSampleIncomes, getDemoSampleData } from '../utils/sampleData';
 import { auth } from '../services/googleAuth';
 import { onAuthStateChanged, User } from 'firebase/auth';
 import {
-  subscribeToAccountLedger,
-  saveAccountLedgerToCloud,
-  fetchAccountLedgerOnce,
-  subscribeToUserLedger,
-  saveUserLedgerToCloud,
-  fetchUserLedgerOnce,
-  mergeExpenses,
-  mergeIncomes,
-  normalizeEmailAccountKey,
-  CloudLedgerPayload,
+  subscribeToUserTransactions,
+  subscribeToUserSettings,
+  saveTransactionToCloud,
+  deleteTransactionFromCloud,
+  batchSaveTransactionsToCloud,
+  saveBudgetToCloud,
+  saveCategoriesToCloud,
+  fetchLegacyLedgerIfAny,
+  expenseToTransactionDoc,
+  incomeToTransactionDoc,
 } from '../services/cloudSync';
 import { isSoundEnabled, setSoundEnabled } from '../utils/soundEffects';
+import firebaseConfig from '../../firebase-applet-config.json';
 
-export type SyncState = 'synced' | 'syncing' | 'offline' | 'guest';
+export type SyncState = 'synced' | 'syncing' | 'offline' | 'error' | 'guest';
 
 interface ExpenseContextType {
   // Expenses
@@ -96,8 +98,19 @@ interface ExpenseContextType {
   lastSyncTime: string | null;
   forceSyncNow: () => Promise<void>;
   cloudUser: User | null;
+  authInitialized: boolean;
 
-  // Unified 1-Email = 1-Account System
+  // Safe Diagnostic Info
+  firebaseUid: string | null;
+  userEmail: string | null;
+  firebaseProjectId: string;
+
+  // Migration of local transactions
+  pendingMigrationCount: number;
+  migrateLocalToCloud: () => Promise<void>;
+  dismissMigration: () => void;
+
+  // Backwards compatibility
   accountEmail: string | null;
   connectAccountEmail: (email: string) => Promise<boolean>;
   disconnectAccountEmail: () => void;
@@ -115,14 +128,12 @@ const DEFAULT_BUDGET: BudgetConfig = {
 
 const ExpenseContext = createContext<ExpenseContextType | undefined>(undefined);
 
-// Storage keys
-const STORAGE_KEY_EXPENSES = 'aura_personal_expenses_v2';
-const STORAGE_KEY_INCOMES = 'aura_personal_incomes_v2';
-const STORAGE_KEY_BUDGET = 'aura_personal_budget_v2';
+// Storage key prefixes
+const STORAGE_PREFIX = 'aura_v3';
+const STORAGE_KEY_LEGACY_EXPENSES = 'aura_personal_expenses_v2';
+const STORAGE_KEY_LEGACY_INCOMES = 'aura_personal_incomes_v2';
 const STORAGE_KEY_THEME = 'aura_theme_v2';
 const STORAGE_KEY_DAILY_SECTION = 'aura_daily_section_v2';
-const STORAGE_KEY_ACCOUNT_EMAIL = 'aura_unified_account_email';
-const STORAGE_KEY_CATEGORIES = 'aura_personal_categories_v2';
 const STORAGE_KEY_ACTIVE_TAB = 'aura_active_tab_v2';
 
 const VALID_TABS: PageTab[] = [
@@ -139,20 +150,10 @@ const VALID_TABS: PageTab[] = [
 const getTabFromUrl = (): PageTab => {
   if (typeof window === 'undefined') return 'dashboard';
   const hash = window.location.hash.replace(/^#\/?/, '').toLowerCase().trim();
-  if (VALID_TABS.includes(hash as PageTab)) {
-    return hash as PageTab;
-  }
+  if (VALID_TABS.includes(hash as PageTab)) return hash as PageTab;
   if (hash === 'budget' || hash === 'budgets-limits') return 'budget-limits';
   if (hash === 'export' || hash === 'export-backup') return 'backup';
   if (hash === 'settings' || hash === 'account') return 'budgets';
-
-  const pathname = window.location.pathname.replace(/^\//, '').toLowerCase().trim();
-  if (VALID_TABS.includes(pathname as PageTab)) {
-    return pathname as PageTab;
-  }
-  if (pathname === 'budget' || pathname === 'budgets-limits') return 'budget-limits';
-  if (pathname === 'export' || pathname === 'export-backup') return 'backup';
-  if (pathname === 'settings' || pathname === 'account') return 'budgets';
 
   try {
     const saved = localStorage.getItem(STORAGE_KEY_ACTIVE_TAB);
@@ -191,7 +192,7 @@ export const ExpenseProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
   const toggleDarkMode = () => setDarkMode((prev) => !prev);
 
-  // Sound Effects preference state (Default: ON)
+  // Sound Effects preference
   const [soundEffectsEnabled, setSoundEffectsEnabledState] = useState<boolean>(() => isSoundEnabled());
 
   const setSoundEffectsEnabled = useCallback((enabled: boolean) => {
@@ -207,81 +208,64 @@ export const ExpenseProvider: React.FC<{ children: React.ReactNode }> = ({ child
     });
   }, []);
 
+  // Online / Offline tracking
+  const [isOnline, setIsOnline] = useState<boolean>(() =>
+    typeof navigator !== 'undefined' ? navigator.onLine : true
+  );
+
   useEffect(() => {
-    const handlePrefChange = (e: Event) => {
-      const customEvent = e as CustomEvent<{ enabled: boolean }>;
-      if (typeof customEvent.detail?.enabled === 'boolean') {
-        setSoundEffectsEnabledState(customEvent.detail.enabled);
-      }
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
     };
-    window.addEventListener('aura_sound_pref_changed', handlePrefChange);
-    return () => window.removeEventListener('aura_sound_pref_changed', handlePrefChange);
   }, []);
 
-  // Local storage initial state
-  const [expenses, setExpenses] = useState<Expense[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_EXPENSES);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
-      }
-    } catch (e) {
-      console.warn('Failed to load local expenses', e);
-    }
-    return getInitialSampleExpenses();
-  });
+  // Auth & User canonical state
+  const [cloudUser, setCloudUser] = useState<User | null>(() => auth.currentUser);
+  const [authInitialized, setAuthInitialized] = useState<boolean>(false);
+  const [syncState, setSyncState] = useState<SyncState>('syncing');
+  const [lastSyncTime, setLastSyncTime] = useState<string | null>(null);
 
-  const [incomes, setIncomes] = useState<Income[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_INCOMES);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
-      }
-    } catch (e) {
-      console.warn('Failed to load local incomes', e);
-    }
-    return getInitialSampleIncomes();
-  });
+  // Core Ledger state
+  const [expenses, setExpenses] = useState<Expense[]>([]);
+  const [incomes, setIncomes] = useState<Income[]>([]);
+  const [budget, setBudget] = useState<BudgetConfig>(DEFAULT_BUDGET);
+  const [categories, setCategories] = useState<Record<string, CategoryInfo>>(CATEGORIES);
 
-  const [budget, setBudget] = useState<BudgetConfig>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_BUDGET);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (!parsed.currency) parsed.currency = '₹';
-        return { ...DEFAULT_BUDGET, ...parsed };
-      }
-    } catch (e) {
-      console.warn('Failed to load budget config', e);
-    }
-    return DEFAULT_BUDGET;
-  });
+  // Migration state for unmigrated local device data
+  const [pendingMigrationCount, setPendingMigrationCount] = useState<number>(0);
+  const unmigratedLocalDataRef = useRef<{ expenses: Expense[]; incomes: Income[] } | null>(null);
 
-  // Dynamic Categories (Single Source of Truth)
-  const [categories, setCategories] = useState<Record<string, CategoryInfo>>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_CATEGORIES);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (parsed && typeof parsed === 'object' && Object.keys(parsed).length > 0) {
-          return { ...CATEGORIES, ...parsed };
-        }
-      }
-    } catch (e) {
-      console.warn('Failed to load local categories', e);
-    }
-    return CATEGORIES;
-  });
-
-  const categoryList = useMemo(() => Object.values(categories), [categories]);
+  // Refs to maintain fresh state inside async subscriptions without stale closures
+  const expensesRef = useRef(expenses);
+  const incomesRef = useRef(incomes);
+  const budgetRef = useRef(budget);
+  const categoriesRef = useRef(categories);
+  const currentUserRef = useRef<User | null>(cloudUser);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY_CATEGORIES, JSON.stringify(categories));
-    } catch {}
+    expensesRef.current = expenses;
+  }, [expenses]);
+
+  useEffect(() => {
+    incomesRef.current = incomes;
+  }, [incomes]);
+
+  useEffect(() => {
+    budgetRef.current = budget;
+  }, [budget]);
+
+  useEffect(() => {
+    categoriesRef.current = categories;
   }, [categories]);
+
+  useEffect(() => {
+    currentUserRef.current = cloudUser;
+  }, [cloudUser]);
 
   // Daily Section Tab
   const [dailySectionTab, setDailySectionTabState] = useState<DailySectionTab>(() => {
@@ -301,7 +285,7 @@ export const ExpenseProvider: React.FC<{ children: React.ReactNode }> = ({ child
     } catch {}
   };
 
-  // Navigation & UI state with browser URL synchronization (direct entry, refresh, popstate)
+  // Navigation tab
   const [activeTab, setActiveTabState] = useState<PageTab>(getTabFromUrl);
 
   const setActiveTab = useCallback((tab: PageTab) => {
@@ -328,7 +312,6 @@ export const ExpenseProvider: React.FC<{ children: React.ReactNode }> = ({ child
     window.addEventListener('popstate', handleLocationChange);
     window.addEventListener('hashchange', handleLocationChange);
 
-    // Sync initial hash if none exists
     if (!window.location.hash && !window.location.pathname.replace(/^\//, '')) {
       window.history.replaceState({ tab: activeTab }, '', `#/${activeTab}`);
     }
@@ -339,6 +322,7 @@ export const ExpenseProvider: React.FC<{ children: React.ReactNode }> = ({ child
     };
   }, [activeTab]);
 
+  // Modal state
   const [isAddModalOpen, setIsAddModalOpen] = useState<boolean>(false);
   const [modalType, setModalType] = useState<'expense' | 'income'>('expense');
 
@@ -360,362 +344,401 @@ export const ExpenseProvider: React.FC<{ children: React.ReactNode }> = ({ child
     return `${y}-${m}-${day}`;
   });
 
-  // Unified 1-Email = 1-Account State
-  const [accountEmail, setAccountEmailState] = useState<string | null>(() => {
+  // Cached user cache loader
+  const loadUserOfflineCache = useCallback((uid: string) => {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY_ACCOUNT_EMAIL);
-      if (saved && saved.includes('@')) {
-        return saved.trim().toLowerCase();
+      const cachedExp = localStorage.getItem(`${STORAGE_PREFIX}_${uid}_expenses`);
+      const cachedInc = localStorage.getItem(`${STORAGE_PREFIX}_${uid}_incomes`);
+      const cachedBudget = localStorage.getItem(`${STORAGE_PREFIX}_${uid}_budget`);
+      const cachedCats = localStorage.getItem(`${STORAGE_PREFIX}_${uid}_categories`);
+
+      if (cachedExp) {
+        const parsed = JSON.parse(cachedExp);
+        if (Array.isArray(parsed) && parsed.length > 0) setExpenses(parsed);
       }
-      const remembered =
-        localStorage.getItem('aura_remembered_account') ||
-        localStorage.getItem('aura_remembered_google_account');
-      if (remembered) {
-        const parsed = JSON.parse(remembered);
-        if (parsed?.email && parsed.email.includes('@')) {
-          return parsed.email.trim().toLowerCase();
-        }
+      if (cachedInc) {
+        const parsed = JSON.parse(cachedInc);
+        if (Array.isArray(parsed) && parsed.length > 0) setIncomes(parsed);
       }
-      if (auth.currentUser?.email) {
-        return auth.currentUser.email.trim().toLowerCase();
+      if (cachedBudget) {
+        const parsed = JSON.parse(cachedBudget);
+        if (parsed) setBudget(parsed);
       }
-    } catch {}
-    return null;
-  });
-
-  // Real-time Cloud Sync State
-  const [cloudUser, setCloudUser] = useState<User | null>(() => auth.currentUser);
-  const [syncState, setSyncState] = useState<SyncState>(() => (accountEmail ? 'synced' : 'guest'));
-  const [lastSyncTime, setLastSyncTime] = useState<string | null>(null);
-
-  // References to keep callbacks fresh without triggering re-renders
-  const isIncomingFromCloudRef = useRef(false);
-  const cloudSaveTimerRef = useRef<any>(null);
-  const expensesRef = useRef(expenses);
-  const incomesRef = useRef(incomes);
-  const budgetRef = useRef(budget);
-  const accountEmailRef = useRef(accountEmail);
-
-  useEffect(() => {
-    expensesRef.current = expenses;
-    try {
-      localStorage.setItem(STORAGE_KEY_EXPENSES, JSON.stringify(expenses));
-    } catch {}
-  }, [expenses]);
-
-  useEffect(() => {
-    incomesRef.current = incomes;
-    try {
-      localStorage.setItem(STORAGE_KEY_INCOMES, JSON.stringify(incomes));
-    } catch {}
-  }, [incomes]);
-
-  useEffect(() => {
-    budgetRef.current = budget;
-    try {
-      localStorage.setItem(STORAGE_KEY_BUDGET, JSON.stringify(budget));
-    } catch {}
-  }, [budget]);
-
-  useEffect(() => {
-    accountEmailRef.current = accountEmail;
-  }, [accountEmail]);
-
-  // Debounced cloud save function for both central Account email & Firebase User UID
-  const scheduleCloudSave = useCallback((
-    newExpenses: Expense[],
-    newIncomes: Income[],
-    newBudget: BudgetConfig
-  ) => {
-    const activeEmail = accountEmailRef.current;
-    const currentUser = auth.currentUser;
-
-    if ((!activeEmail && !currentUser) || isIncomingFromCloudRef.current) {
-      return;
-    }
-
-    if (cloudSaveTimerRef.current) {
-      clearTimeout(cloudSaveTimerRef.current);
-    }
-
-    setSyncState('syncing');
-    cloudSaveTimerRef.current = setTimeout(async () => {
-      let savedOk = false;
-
-      // 1. Save to central 1-Email = 1-Account store (Computer & Mobile shared access)
-      if (activeEmail) {
-        const ok = await saveAccountLedgerToCloud(activeEmail, {
-          expenses: newExpenses,
-          incomes: newIncomes,
-          budget: newBudget,
-        });
-        if (ok) savedOk = true;
+      if (cachedCats) {
+        const parsed = JSON.parse(cachedCats);
+        if (parsed && typeof parsed === 'object') setCategories((prev) => ({ ...prev, ...parsed }));
       }
-
-      // 2. Also save to user UID doc if authenticated with Google
-      if (currentUser?.uid) {
-        const ok = await saveUserLedgerToCloud(currentUser.uid, {
-          expenses: newExpenses,
-          incomes: newIncomes,
-          budget: newBudget,
-        });
-        if (ok) savedOk = true;
-      }
-
-      if (savedOk) {
-        setSyncState('synced');
-        const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        setLastSyncTime(now);
-      } else {
-        setSyncState('offline');
-      }
-    }, 300);
-  }, []);
-
-  // Connect or switch Account Email
-  const connectAccountEmail = useCallback(async (email: string): Promise<boolean> => {
-    const normalized = normalizeEmailAccountKey(email);
-    if (!normalized || !normalized.includes('@')) return false;
-
-    setAccountEmailState(normalized);
-    try {
-      localStorage.setItem(STORAGE_KEY_ACCOUNT_EMAIL, normalized);
-    } catch {}
-
-    setSyncState('syncing');
-    try {
-      const cloudData = await fetchAccountLedgerOnce(normalized);
-      if (cloudData && (cloudData.expenses.length > 0 || cloudData.incomes.length > 0)) {
-        isIncomingFromCloudRef.current = true;
-        setExpenses(cloudData.expenses);
-        setIncomes(cloudData.incomes);
-        if (cloudData.budget) {
-          setBudget((prev) => ({ ...prev, ...cloudData.budget }));
-        }
-        setTimeout(() => {
-          isIncomingFromCloudRef.current = false;
-        }, 300);
-      } else {
-        // First time initializing this email account in cloud: push existing ledger
-        await saveAccountLedgerToCloud(normalized, {
-          expenses: expensesRef.current,
-          incomes: incomesRef.current,
-          budget: budgetRef.current,
-        });
-      }
-      setSyncState('synced');
-      setLastSyncTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }));
-      return true;
     } catch (err) {
-      console.warn('Connect account email notice:', err);
-      setSyncState('offline');
-      return false;
+      console.warn('Error reading user offline cache:', err);
     }
   }, []);
 
-  const disconnectAccountEmail = useCallback(() => {
-    setAccountEmailState(null);
+  // Save to user-specific offline cache
+  const saveUserOfflineCache = useCallback((
+    uid: string,
+    curExpenses: Expense[],
+    curIncomes: Income[],
+    curBudget: BudgetConfig,
+    curCategories: Record<string, CategoryInfo>
+  ) => {
     try {
-      localStorage.removeItem(STORAGE_KEY_ACCOUNT_EMAIL);
-      localStorage.removeItem('aura_remembered_account');
-      localStorage.removeItem('aura_remembered_google_account');
+      localStorage.setItem(`${STORAGE_PREFIX}_${uid}_expenses`, JSON.stringify(curExpenses));
+      localStorage.setItem(`${STORAGE_PREFIX}_${uid}_incomes`, JSON.stringify(curIncomes));
+      localStorage.setItem(`${STORAGE_PREFIX}_${uid}_budget`, JSON.stringify(curBudget));
+      localStorage.setItem(`${STORAGE_PREFIX}_${uid}_categories`, JSON.stringify(curCategories));
     } catch {}
-    setSyncState('guest');
   }, []);
 
-  // Listen to Firestore real-time updates for Central 1-Email = 1-Account store
-  useEffect(() => {
-    if (!accountEmail) return;
+  // Load guest local data
+  const loadGuestData = useCallback(() => {
+    try {
+      const savedExp = localStorage.getItem(`${STORAGE_PREFIX}_guest_expenses`) || localStorage.getItem(STORAGE_KEY_LEGACY_EXPENSES);
+      const savedInc = localStorage.getItem(`${STORAGE_PREFIX}_guest_incomes`) || localStorage.getItem(STORAGE_KEY_LEGACY_INCOMES);
 
-    setSyncState('syncing');
-
-    // Subscribe to real-time changes on this email's central document
-    const unsubscribeSnapshot = subscribeToAccountLedger(
-      accountEmail,
-      (cloudData: CloudLedgerPayload) => {
-        isIncomingFromCloudRef.current = true;
-
-        if (Array.isArray(cloudData.expenses)) {
-          setExpenses(cloudData.expenses);
+      if (savedExp) {
+        const parsed = JSON.parse(savedExp);
+        if (Array.isArray(parsed)) {
+          setExpenses(parsed);
+        } else {
+          setExpenses(getInitialSampleExpenses());
         }
-        if (Array.isArray(cloudData.incomes)) {
-          setIncomes(cloudData.incomes);
-        }
-
-        if (cloudData.budget) {
-          setBudget((prev) => ({ ...prev, ...cloudData.budget }));
-        }
-
-        const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        setLastSyncTime(now);
-        setSyncState('synced');
-
-        setTimeout(() => {
-          isIncomingFromCloudRef.current = false;
-        }, 300);
-      },
-      (err) => {
-        console.warn('Real-time account ledger listener notice:', err);
-        setSyncState('offline');
+      } else {
+        setExpenses(getInitialSampleExpenses());
       }
-    );
 
-    return () => {
-      unsubscribeSnapshot();
-    };
-  }, [accountEmail]);
+      if (savedInc) {
+        const parsed = JSON.parse(savedInc);
+        if (Array.isArray(parsed)) {
+          setIncomes(parsed);
+        } else {
+          setIncomes(getInitialSampleIncomes());
+        }
+      } else {
+        setIncomes(getInitialSampleIncomes());
+      }
+    } catch {
+      setExpenses(getInitialSampleExpenses());
+      setIncomes(getInitialSampleIncomes());
+    }
+  }, []);
 
-  // Listen to Firebase Auth state
+  // Flush offline pending transactions when back online
   useEffect(() => {
-    let unsubscribeUserSnapshot: (() => void) | null = null;
+    if (!isOnline || !cloudUser?.uid) return;
+
+    try {
+      const pendingRaw = localStorage.getItem(`${STORAGE_PREFIX}_${cloudUser.uid}_pending`);
+      if (pendingRaw) {
+        const pendingList: TransactionDoc[] = JSON.parse(pendingRaw);
+        if (Array.isArray(pendingList) && pendingList.length > 0) {
+          batchSaveTransactionsToCloud(cloudUser.uid, pendingList).then((ok) => {
+            if (ok) {
+              localStorage.removeItem(`${STORAGE_PREFIX}_${cloudUser.uid}_pending`);
+            }
+          });
+        }
+      }
+    } catch {}
+  }, [isOnline, cloudUser]);
+
+  // MAIN AUTH & SUBSCRIPTION LIFECYCLE
+  useEffect(() => {
+    let unsubscribeTx: (() => void) | null = null;
+    let unsubscribeSettings: (() => void) | null = null;
 
     const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
       setCloudUser(user);
+      currentUserRef.current = user;
+      setAuthInitialized(true);
 
-      if (unsubscribeUserSnapshot) {
-        unsubscribeUserSnapshot();
-        unsubscribeUserSnapshot = null;
+      // Clean up previous subscriptions if any
+      if (unsubscribeTx) {
+        unsubscribeTx();
+        unsubscribeTx = null;
+      }
+      if (unsubscribeSettings) {
+        unsubscribeSettings();
+        unsubscribeSettings = null;
       }
 
       if (user) {
-        // Automatically sync email account if user signed in with Google
-        if (user.email) {
-          const userEmail = user.email.toLowerCase().trim();
-          if (!accountEmailRef.current || accountEmailRef.current !== userEmail) {
-            connectAccountEmail(userEmail);
-          } else {
-            setSyncState('synced');
-          }
-        }
+        // Authenticated with Firebase UID: canonical source of truth
+        setSyncState('syncing');
 
-        // Also maintain backup user UID subscription
-        unsubscribeUserSnapshot = subscribeToUserLedger(
+        // 1. Instantly populate UI from user's local cache if available (prevent blank screen)
+        loadUserOfflineCache(user.uid);
+
+        // 2. Subscribe to real-time transactions in users/{userId}/transactions
+        let isFirstSnapshot = true;
+        unsubscribeTx = subscribeToUserTransactions(
           user.uid,
-          (cloudData: CloudLedgerPayload) => {
-            if (!accountEmailRef.current) {
-              isIncomingFromCloudRef.current = true;
-              if (Array.isArray(cloudData.expenses)) setExpenses(cloudData.expenses);
-              if (Array.isArray(cloudData.incomes)) setIncomes(cloudData.incomes);
-              if (cloudData.budget) setBudget((prev) => ({ ...prev, ...cloudData.budget }));
-              setSyncState('synced');
-              setTimeout(() => {
-                isIncomingFromCloudRef.current = false;
-              }, 300);
+          async (cloudExpenses, cloudIncomes) => {
+            setExpenses(cloudExpenses);
+            setIncomes(cloudIncomes);
+            saveUserOfflineCache(user.uid, cloudExpenses, cloudIncomes, budgetRef.current, categoriesRef.current);
+            setSyncState('synced');
+            setLastSyncTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }));
+
+            // On first snapshot, if cloud collection has 0 items, check for legacy or local data to migrate seamlessly
+            if (isFirstSnapshot) {
+              isFirstSnapshot = false;
+              if (cloudExpenses.length === 0 && cloudIncomes.length === 0) {
+                // Check legacy Firestore paths first
+                const legacy = await fetchLegacyLedgerIfAny(user.uid, user.email);
+                if (legacy && (legacy.expenses.length > 0 || legacy.incomes.length > 0)) {
+                  console.info('Migrating legacy Firestore ledger into canonical transactions collection...');
+                  const txList: TransactionDoc[] = [
+                    ...legacy.expenses.map((e) => expenseToTransactionDoc(user.uid, e)),
+                    ...legacy.incomes.map((i) => incomeToTransactionDoc(user.uid, i)),
+                  ];
+                  await batchSaveTransactionsToCloud(user.uid, txList);
+                  if (legacy.budget) {
+                    await saveBudgetToCloud(user.uid, legacy.budget);
+                  }
+                  return;
+                }
+
+                // Check if device has unmigrated localStorage transactions
+                try {
+                  const localExpRaw = localStorage.getItem(STORAGE_KEY_LEGACY_EXPENSES);
+                  const localIncRaw = localStorage.getItem(STORAGE_KEY_LEGACY_INCOMES);
+                  const localExp = localExpRaw ? JSON.parse(localExpRaw) : [];
+                  const localInc = localIncRaw ? JSON.parse(localIncRaw) : [];
+                  const totalLocal = (Array.isArray(localExp) ? localExp.length : 0) + (Array.isArray(localInc) ? localInc.length : 0);
+
+                  if (totalLocal > 0) {
+                    unmigratedLocalDataRef.current = { expenses: localExp, incomes: localInc };
+                    setPendingMigrationCount(totalLocal);
+                  }
+                } catch {}
+              }
             }
           },
-          () => {}
+          (err) => {
+            console.warn('Real-time transactions error:', err);
+            setSyncState('error');
+          }
         );
-      } else if (!accountEmailRef.current) {
+
+        // 3. Subscribe to real-time settings in users/{userId}/settings
+        unsubscribeSettings = subscribeToUserSettings(
+          user.uid,
+          (cloudBudget) => {
+            setBudget(cloudBudget);
+            saveUserOfflineCache(user.uid, expensesRef.current, incomesRef.current, cloudBudget, categoriesRef.current);
+          },
+          (cloudCategories) => {
+            setCategories((prev) => ({ ...prev, ...cloudCategories }));
+            saveUserOfflineCache(user.uid, expensesRef.current, incomesRef.current, budgetRef.current, {
+              ...categoriesRef.current,
+              ...cloudCategories,
+            });
+          }
+        );
+      } else {
+        // User is not signed in: guest mode
         setSyncState('guest');
+        loadGuestData();
       }
     });
 
     return () => {
       unsubscribeAuth();
-      if (unsubscribeUserSnapshot) unsubscribeUserSnapshot();
-      if (cloudSaveTimerRef.current) clearTimeout(cloudSaveTimerRef.current);
+      if (unsubscribeTx) unsubscribeTx();
+      if (unsubscribeSettings) unsubscribeSettings();
     };
-  }, [connectAccountEmail]);
+  }, [loadUserOfflineCache, loadGuestData, saveUserOfflineCache]);
 
-  // Manual Force Sync
-  const forceSyncNow = async () => {
-    const activeEmail = accountEmailRef.current;
-    const user = auth.currentUser;
+  // Local Data Migration Handlers
+  const migrateLocalToCloud = useCallback(async () => {
+    const user = currentUserRef.current;
+    const localData = unmigratedLocalDataRef.current;
+    if (!user || !localData) return;
 
-    if (!activeEmail && !user) return;
     setSyncState('syncing');
+    const txList: TransactionDoc[] = [
+      ...localData.expenses.map((e) => expenseToTransactionDoc(user.uid, e)),
+      ...localData.incomes.map((i) => incomeToTransactionDoc(user.uid, i)),
+    ];
 
+    const ok = await batchSaveTransactionsToCloud(user.uid, txList);
+    if (ok) {
+      setPendingMigrationCount(0);
+      unmigratedLocalDataRef.current = null;
+      setSyncState('synced');
+    } else {
+      setSyncState('error');
+    }
+  }, []);
+
+  const dismissMigration = useCallback(() => {
+    setPendingMigrationCount(0);
+    unmigratedLocalDataRef.current = null;
+  }, []);
+
+  // Force Sync Now Action
+  const forceSyncNow = useCallback(async () => {
+    const user = currentUserRef.current;
+    if (!user) return;
+
+    setSyncState('syncing');
     try {
-      if (activeEmail) {
-        const cloudData = await fetchAccountLedgerOnce(activeEmail);
-        if (cloudData) {
-          isIncomingFromCloudRef.current = true;
-          if (Array.isArray(cloudData.expenses)) setExpenses(cloudData.expenses);
-          if (Array.isArray(cloudData.incomes)) setIncomes(cloudData.incomes);
-          if (cloudData.budget) setBudget((prev) => ({ ...prev, ...cloudData.budget }));
-          setTimeout(() => {
-            isIncomingFromCloudRef.current = false;
-          }, 300);
-        } else {
-          await saveAccountLedgerToCloud(activeEmail, {
-            expenses: expensesRef.current,
-            incomes: incomesRef.current,
-            budget: budgetRef.current,
-          });
-        }
-      } else if (user) {
-        const cloudData = await fetchUserLedgerOnce(user.uid);
-        if (cloudData) {
-          isIncomingFromCloudRef.current = true;
-          if (Array.isArray(cloudData.expenses)) setExpenses(cloudData.expenses);
-          if (Array.isArray(cloudData.incomes)) setIncomes(cloudData.incomes);
-          if (cloudData.budget) setBudget((prev) => ({ ...prev, ...cloudData.budget }));
-          setTimeout(() => {
-            isIncomingFromCloudRef.current = false;
-          }, 300);
+      // Re-save offline user cache and flush any pending transactions
+      const pendingRaw = localStorage.getItem(`${STORAGE_PREFIX}_${user.uid}_pending`);
+      if (pendingRaw) {
+        const pendingList: TransactionDoc[] = JSON.parse(pendingRaw);
+        if (Array.isArray(pendingList) && pendingList.length > 0) {
+          await batchSaveTransactionsToCloud(user.uid, pendingList);
+          localStorage.removeItem(`${STORAGE_PREFIX}_${user.uid}_pending`);
         }
       }
       setSyncState('synced');
       setLastSyncTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }));
     } catch (err) {
       console.warn('Manual sync failed:', err);
-      setSyncState('offline');
+      setSyncState('error');
     }
-  };
+  }, []);
 
-  // Expense CRUD
-  const addExpense = (newExp: Omit<Expense, 'id' | 'createdAt'>) => {
+  // EXPENSE CRUD OPERATIONS
+  const addExpense = useCallback((newExp: Omit<Expense, 'id' | 'createdAt'>) => {
+    const user = currentUserRef.current;
+    const stableId = `exp-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
     const created: Expense = {
       ...newExp,
-      id: `exp-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+      id: stableId,
       createdAt: Date.now(),
+      updatedAt: Date.now(),
+      syncStatus: user ? 'synced' : 'pending_sync',
     };
+
+    // Optimistic local state update
     const updated = [created, ...expensesRef.current];
     setExpenses(updated);
-    scheduleCloudSave(updated, incomesRef.current, budgetRef.current);
-  };
 
-  const updateExpense = (id: string, updatedFields: Partial<Expense>) => {
+    if (user) {
+      saveUserOfflineCache(user.uid, updated, incomesRef.current, budgetRef.current, categoriesRef.current);
+      const txDoc = expenseToTransactionDoc(user.uid, created, 'synced');
+      saveTransactionToCloud(user.uid, txDoc).catch(() => {
+        // Queue for offline sync if write fails
+        try {
+          const pendingKey = `${STORAGE_PREFIX}_${user.uid}_pending`;
+          const existingPending: TransactionDoc[] = JSON.parse(localStorage.getItem(pendingKey) || '[]');
+          existingPending.push(txDoc);
+          localStorage.setItem(pendingKey, JSON.stringify(existingPending));
+        } catch {}
+      });
+    } else {
+      try {
+        localStorage.setItem(`${STORAGE_PREFIX}_guest_expenses`, JSON.stringify(updated));
+      } catch {}
+    }
+  }, [saveUserOfflineCache]);
+
+  const updateExpense = useCallback((id: string, updatedFields: Partial<Expense>) => {
+    const user = currentUserRef.current;
     const updated = expensesRef.current.map((item) =>
-      item.id === id ? { ...item, ...updatedFields } : item
+      item.id === id ? { ...item, ...updatedFields, updatedAt: Date.now() } : item
     );
     setExpenses(updated);
-    scheduleCloudSave(updated, incomesRef.current, budgetRef.current);
-  };
 
-  const deleteExpense = (id: string) => {
+    const changedItem = updated.find((item) => item.id === id);
+    if (user && changedItem) {
+      saveUserOfflineCache(user.uid, updated, incomesRef.current, budgetRef.current, categoriesRef.current);
+      const txDoc = expenseToTransactionDoc(user.uid, changedItem, 'synced');
+      saveTransactionToCloud(user.uid, txDoc);
+    } else if (!user) {
+      try {
+        localStorage.setItem(`${STORAGE_PREFIX}_guest_expenses`, JSON.stringify(updated));
+      } catch {}
+    }
+  }, [saveUserOfflineCache]);
+
+  const deleteExpense = useCallback((id: string) => {
+    const user = currentUserRef.current;
     const updated = expensesRef.current.filter((item) => item.id !== id);
     setExpenses(updated);
-    scheduleCloudSave(updated, incomesRef.current, budgetRef.current);
-  };
 
-  // Income CRUD
-  const addIncome = (newInc: Omit<Income, 'id' | 'createdAt'>) => {
+    if (user) {
+      saveUserOfflineCache(user.uid, updated, incomesRef.current, budgetRef.current, categoriesRef.current);
+      deleteTransactionFromCloud(user.uid, id);
+    } else {
+      try {
+        localStorage.setItem(`${STORAGE_PREFIX}_guest_expenses`, JSON.stringify(updated));
+      } catch {}
+    }
+  }, [saveUserOfflineCache]);
+
+  // INCOME CRUD OPERATIONS
+  const addIncome = useCallback((newInc: Omit<Income, 'id' | 'createdAt'>) => {
+    const user = currentUserRef.current;
+    const stableId = `inc-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
     const created: Income = {
       ...newInc,
-      id: `inc-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+      id: stableId,
       createdAt: Date.now(),
+      updatedAt: Date.now(),
+      syncStatus: user ? 'synced' : 'pending_sync',
     };
+
     const updated = [created, ...incomesRef.current];
     setIncomes(updated);
-    scheduleCloudSave(expensesRef.current, updated, budgetRef.current);
-  };
 
-  const updateIncome = (id: string, updatedFields: Partial<Income>) => {
+    if (user) {
+      saveUserOfflineCache(user.uid, expensesRef.current, updated, budgetRef.current, categoriesRef.current);
+      const txDoc = incomeToTransactionDoc(user.uid, created, 'synced');
+      saveTransactionToCloud(user.uid, txDoc).catch(() => {
+        try {
+          const pendingKey = `${STORAGE_PREFIX}_${user.uid}_pending`;
+          const existingPending: TransactionDoc[] = JSON.parse(localStorage.getItem(pendingKey) || '[]');
+          existingPending.push(txDoc);
+          localStorage.setItem(pendingKey, JSON.stringify(existingPending));
+        } catch {}
+      });
+    } else {
+      try {
+        localStorage.setItem(`${STORAGE_PREFIX}_guest_incomes`, JSON.stringify(updated));
+      } catch {}
+    }
+  }, [saveUserOfflineCache]);
+
+  const updateIncome = useCallback((id: string, updatedFields: Partial<Income>) => {
+    const user = currentUserRef.current;
     const updated = incomesRef.current.map((item) =>
-      item.id === id ? { ...item, ...updatedFields } : item
+      item.id === id ? { ...item, ...updatedFields, updatedAt: Date.now() } : item
     );
     setIncomes(updated);
-    scheduleCloudSave(expensesRef.current, updated, budgetRef.current);
-  };
 
-  const deleteIncome = (id: string) => {
+    const changedItem = updated.find((item) => item.id === id);
+    if (user && changedItem) {
+      saveUserOfflineCache(user.uid, expensesRef.current, updated, budgetRef.current, categoriesRef.current);
+      const txDoc = incomeToTransactionDoc(user.uid, changedItem, 'synced');
+      saveTransactionToCloud(user.uid, txDoc);
+    } else if (!user) {
+      try {
+        localStorage.setItem(`${STORAGE_PREFIX}_guest_incomes`, JSON.stringify(updated));
+      } catch {}
+    }
+  }, [saveUserOfflineCache]);
+
+  const deleteIncome = useCallback((id: string) => {
+    const user = currentUserRef.current;
     const updated = incomesRef.current.filter((item) => item.id !== id);
     setIncomes(updated);
-    scheduleCloudSave(expensesRef.current, updated, budgetRef.current);
-  };
 
-  // Category CRUD (Single Source of Truth)
+    if (user) {
+      saveUserOfflineCache(user.uid, expensesRef.current, updated, budgetRef.current, categoriesRef.current);
+      deleteTransactionFromCloud(user.uid, id);
+    } else {
+      try {
+        localStorage.setItem(`${STORAGE_PREFIX}_guest_incomes`, JSON.stringify(updated));
+      } catch {}
+    }
+  }, [saveUserOfflineCache]);
+
+  // CATEGORY MANAGEMENT
+  const categoryList = useMemo(() => Object.values(categories), [categories]);
+
   const addCategory = useCallback((name: string, color?: string, icon?: string): CategoryInfo => {
     const cleanName = name.trim();
     const id = cleanName.toLowerCase().replace(/[^a-z0-9]/g, '_') || `cat_${Date.now()}`;
@@ -733,9 +756,10 @@ export const ExpenseProvider: React.FC<{ children: React.ReactNode }> = ({ child
     };
     setCategories((prev) => {
       const updated = { ...prev, [id]: newCat };
-      try {
-        localStorage.setItem(STORAGE_KEY_CATEGORIES, JSON.stringify(updated));
-      } catch {}
+      const user = currentUserRef.current;
+      if (user) {
+        saveCategoriesToCloud(user.uid, updated);
+      }
       return updated;
     });
     return newCat;
@@ -745,9 +769,10 @@ export const ExpenseProvider: React.FC<{ children: React.ReactNode }> = ({ child
     setCategories((prev) => {
       if (!prev[id]) return prev;
       const updated = { ...prev, [id]: { ...prev[id], ...updates } };
-      try {
-        localStorage.setItem(STORAGE_KEY_CATEGORIES, JSON.stringify(updated));
-      } catch {}
+      const user = currentUserRef.current;
+      if (user) {
+        saveCategoriesToCloud(user.uid, updated);
+      }
       return updated;
     });
   }, []);
@@ -757,35 +782,66 @@ export const ExpenseProvider: React.FC<{ children: React.ReactNode }> = ({ child
     if (usedCount > 0) {
       return {
         success: false,
-        reason: `Cannot delete "${categories[id]?.name || id}" because it is currently used by ${usedCount} transaction${usedCount === 1 ? '' : 's'}. Please reassign or delete these transactions first.`,
+        reason: `Cannot delete "${categories[id]?.name || id}" because it is used by ${usedCount} transaction${usedCount === 1 ? '' : 's'}.`,
       };
     }
     setCategories((prev) => {
       const copy = { ...prev };
       delete copy[id];
-      try {
-        localStorage.setItem(STORAGE_KEY_CATEGORIES, JSON.stringify(copy));
-      } catch {}
+      const user = currentUserRef.current;
+      if (user) {
+        saveCategoriesToCloud(user.uid, copy);
+      }
       return copy;
     });
     return { success: true };
   }, [categories]);
 
-  // Data management
-  const clearAll = () => {
+  // BUDGET MANAGEMENT
+  const updateBudget = useCallback((updates: Partial<BudgetConfig>) => {
+    const newBudget = { ...budgetRef.current, ...updates };
+    setBudget(newBudget);
+    const user = currentUserRef.current;
+    if (user) {
+      saveBudgetToCloud(user.uid, newBudget);
+      saveUserOfflineCache(user.uid, expensesRef.current, incomesRef.current, newBudget, categoriesRef.current);
+    }
+  }, [saveUserOfflineCache]);
+
+  // DATA MANAGEMENT
+  const clearAll = useCallback(() => {
+    const user = currentUserRef.current;
+    const currentExp = expensesRef.current;
+    const currentInc = incomesRef.current;
     setExpenses([]);
     setIncomes([]);
-    scheduleCloudSave([], [], budgetRef.current);
-  };
 
-  const resetToSample = () => {
+    if (user) {
+      currentExp.forEach((e) => deleteTransactionFromCloud(user.uid, e.id));
+      currentInc.forEach((i) => deleteTransactionFromCloud(user.uid, i.id));
+      saveUserOfflineCache(user.uid, [], [], budgetRef.current, categoriesRef.current);
+    } else {
+      localStorage.removeItem(`${STORAGE_PREFIX}_guest_expenses`);
+      localStorage.removeItem(`${STORAGE_PREFIX}_guest_incomes`);
+    }
+  }, [saveUserOfflineCache]);
+
+  const resetToSample = useCallback(() => {
     const demo = getDemoSampleData();
     setExpenses(demo.expenses);
     setIncomes(demo.incomes);
-    scheduleCloudSave(demo.expenses, demo.incomes, budgetRef.current);
-  };
+    const user = currentUserRef.current;
+    if (user) {
+      const txList: TransactionDoc[] = [
+        ...demo.expenses.map((e) => expenseToTransactionDoc(user.uid, e)),
+        ...demo.incomes.map((i) => incomeToTransactionDoc(user.uid, i)),
+      ];
+      batchSaveTransactionsToCloud(user.uid, txList);
+      saveUserOfflineCache(user.uid, demo.expenses, demo.incomes, budgetRef.current, categoriesRef.current);
+    }
+  }, [saveUserOfflineCache]);
 
-  const importAllData = (data: {
+  const importAllData = useCallback((data: {
     expenses?: Expense[];
     incomes?: Income[];
     budget?: BudgetConfig;
@@ -795,20 +851,28 @@ export const ExpenseProvider: React.FC<{ children: React.ReactNode }> = ({ child
     const newIncomes = Array.isArray(data.incomes) ? data.incomes : incomesRef.current;
     setExpenses(newExpenses);
     setIncomes(newIncomes);
-    if (data.budget) {
-      setBudget((prev) => ({ ...prev, ...data.budget }));
-    }
-    if (data.categories && typeof data.categories === 'object') {
-      setCategories((prev) => ({ ...prev, ...data.categories }));
-    }
-    scheduleCloudSave(newExpenses, newIncomes, data.budget || budgetRef.current);
-  };
+    if (data.budget) setBudget((prev) => ({ ...prev, ...data.budget }));
+    if (data.categories) setCategories((prev) => ({ ...prev, ...data.categories }));
 
-  const updateBudget = (updates: Partial<BudgetConfig>) => {
-    const newBudget = { ...budgetRef.current, ...updates };
-    setBudget(newBudget);
-    scheduleCloudSave(expensesRef.current, incomesRef.current, newBudget);
-  };
+    const user = currentUserRef.current;
+    if (user) {
+      const txList: TransactionDoc[] = [
+        ...newExpenses.map((e) => expenseToTransactionDoc(user.uid, e)),
+        ...newIncomes.map((i) => incomeToTransactionDoc(user.uid, i)),
+      ];
+      batchSaveTransactionsToCloud(user.uid, txList);
+      if (data.budget) saveBudgetToCloud(user.uid, data.budget);
+      if (data.categories) saveCategoriesToCloud(user.uid, data.categories);
+      saveUserOfflineCache(user.uid, newExpenses, newIncomes, data.budget || budgetRef.current, data.categories || categoriesRef.current);
+    }
+  }, [saveUserOfflineCache]);
+
+  // Backwards compatibility functions
+  const connectAccountEmail = useCallback(async (_email: string): Promise<boolean> => {
+    return true;
+  }, []);
+
+  const disconnectAccountEmail = useCallback(() => {}, []);
 
   return (
     <ExpenseContext.Provider
@@ -851,7 +915,14 @@ export const ExpenseProvider: React.FC<{ children: React.ReactNode }> = ({ child
         lastSyncTime,
         forceSyncNow,
         cloudUser,
-        accountEmail,
+        authInitialized,
+        firebaseUid: cloudUser?.uid || null,
+        userEmail: cloudUser?.email || null,
+        firebaseProjectId: firebaseConfig.projectId,
+        pendingMigrationCount,
+        migrateLocalToCloud,
+        dismissMigration,
+        accountEmail: cloudUser?.email || null,
         connectAccountEmail,
         disconnectAccountEmail,
       }}

@@ -2,12 +2,22 @@ import {
   doc,
   setDoc,
   getDoc,
+  getDocs,
+  deleteDoc,
+  collection,
   onSnapshot,
+  writeBatch,
   Unsubscribe,
-  serverTimestamp,
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from './googleAuth';
-import { Expense, Income, BudgetConfig } from '../types/expense';
+import {
+  Expense,
+  Income,
+  BudgetConfig,
+  CategoryInfo,
+  TransactionDoc,
+  TransactionType,
+} from '../types/expense';
 
 export interface CloudLedgerPayload {
   expenses: Expense[];
@@ -19,164 +29,240 @@ export interface CloudLedgerPayload {
 }
 
 /**
- * Returns current device type
+ * Returns current device type for analytics/diagnostics
  */
-export const getDevicePlatform = (): 'Mobile' | 'Web' => {
-  if (typeof navigator !== 'undefined' && /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent)) {
-    return 'Mobile';
-  }
-  return 'Web';
+export const getDevicePlatform = (): 'Mobile' | 'Desktop' | 'Tablet' => {
+  if (typeof navigator === 'undefined') return 'Desktop';
+  const ua = navigator.userAgent;
+  if (/iPad|Tablet/i.test(ua)) return 'Tablet';
+  if (/Mobi|Android|iPhone/i.test(ua)) return 'Mobile';
+  return 'Desktop';
 };
 
 /**
- * Normalizes an email address to serve as a consistent 1-Account ID across all devices
- * Format: clean lowercase string
+ * Converts an Expense into a canonical TransactionDoc
  */
-export const normalizeEmailAccountKey = (rawEmail: string): string => {
-  if (!rawEmail) return '';
-  return rawEmail
-    .trim()
-    .toLowerCase()
-    .replace(/[\/\s]/g, '_');
-};
+export const expenseToTransactionDoc = (
+  userId: string,
+  exp: Expense,
+  syncStatus: 'synced' | 'pending_sync' = 'synced'
+): TransactionDoc => ({
+  id: exp.id,
+  userId,
+  type: 'expense',
+  amount: Number(exp.amount),
+  title: exp.title || 'Untitled Expense',
+  category: exp.category || 'other',
+  date: exp.date,
+  time: exp.time,
+  paymentMethod: exp.paymentMethod,
+  notes: exp.notes,
+  createdAt: exp.createdAt || Date.now(),
+  updatedAt: exp.updatedAt || Date.now(),
+  syncStatus,
+});
 
 /**
- * Merges local and incoming cloud expenses safely, avoiding duplicate entries by unique id
+ * Converts an Income into a canonical TransactionDoc
  */
-export const mergeExpenses = (local: Expense[], incoming: Expense[]): Expense[] => {
-  const map = new Map<string, Expense>();
-  // Cloud records take baseline precedence
-  incoming.forEach((item) => {
-    if (item && item.id) {
-      map.set(item.id, item);
-    }
-  });
-  // Add local items if they don't exist yet
-  local.forEach((item) => {
-    if (item && item.id && !map.has(item.id)) {
-      map.set(item.id, item);
-    }
-  });
-  // Sort descending by date, then createdAt
-  return Array.from(map.values()).sort((a, b) => {
-    const dateComp = new Date(b.date).getTime() - new Date(a.date).getTime();
-    if (dateComp !== 0) return dateComp;
-    return (b.createdAt || 0) - (a.createdAt || 0);
-  });
-};
+export const incomeToTransactionDoc = (
+  userId: string,
+  inc: Income,
+  syncStatus: 'synced' | 'pending_sync' = 'synced'
+): TransactionDoc => ({
+  id: inc.id,
+  userId,
+  type: 'income',
+  amount: Number(inc.amount),
+  title: inc.title || 'Untitled Income',
+  category: inc.category || 'other_income',
+  date: inc.date,
+  time: inc.time,
+  paymentMethod: inc.paymentMethod,
+  notes: inc.notes,
+  createdAt: inc.createdAt || Date.now(),
+  updatedAt: inc.updatedAt || Date.now(),
+  syncStatus,
+});
 
 /**
- * Merges local and incoming cloud incomes safely
+ * Converts a TransactionDoc back into an Expense
  */
-export const mergeIncomes = (local: Income[], incoming: Income[]): Income[] => {
-  const map = new Map<string, Income>();
-  incoming.forEach((item) => {
-    if (item && item.id) {
-      map.set(item.id, item);
-    }
-  });
-  local.forEach((item) => {
-    if (item && item.id && !map.has(item.id)) {
-      map.set(item.id, item);
-    }
-  });
-  return Array.from(map.values()).sort((a, b) => {
-    const dateComp = new Date(b.date).getTime() - new Date(a.date).getTime();
-    if (dateComp !== 0) return dateComp;
-    return (b.createdAt || 0) - (a.createdAt || 0);
-  });
-};
+export const transactionDocToExpense = (docData: TransactionDoc): Expense => ({
+  id: docData.id,
+  title: docData.title,
+  amount: Number(docData.amount),
+  category: docData.category as any,
+  date: docData.date,
+  time: docData.time,
+  paymentMethod: docData.paymentMethod,
+  notes: docData.notes,
+  createdAt: docData.createdAt,
+  updatedAt: docData.updatedAt,
+  syncStatus: docData.syncStatus,
+});
 
 /**
- * UNIFIED 1-EMAIL = 1-ACCOUNT STORE:
- * Subscribes to the single central ledger for a given email address.
- * Automatically receives instantaneous updates when entries are added or modified
- * on Computer Web, Mobile Web, or any device accessing via this email.
+ * Converts a TransactionDoc back into an Income
  */
-export const subscribeToAccountLedger = (
-  accountEmail: string,
-  onUpdate: (data: CloudLedgerPayload) => void,
+export const transactionDocToIncome = (docData: TransactionDoc): Income => ({
+  id: docData.id,
+  title: docData.title,
+  amount: Number(docData.amount),
+  category: docData.category as any,
+  date: docData.date,
+  time: docData.time,
+  paymentMethod: docData.paymentMethod,
+  notes: docData.notes,
+  createdAt: docData.createdAt,
+  updatedAt: docData.updatedAt,
+  syncStatus: docData.syncStatus,
+});
+
+/**
+ * CANONICAL REAL-TIME SUBSCRIBER:
+ * Subscribes to the authenticated user's individual transactions subcollection:
+ * users/{userId}/transactions
+ * Provides real-time synchronization between Mobile, Tablet, and Desktop.
+ */
+export const subscribeToUserTransactions = (
+  userId: string,
+  onUpdate: (expenses: Expense[], incomes: Income[]) => void,
   onError?: (error: any) => void
 ): Unsubscribe => {
-  const accountKey = normalizeEmailAccountKey(accountEmail);
-  const path = `accounts/${accountKey}/ledger/current`;
-  const ledgerDocRef = doc(db, 'accounts', accountKey, 'ledger', 'current');
+  const collectionPath = `users/${userId}/transactions`;
+  const txCollectionRef = collection(db, 'users', userId, 'transactions');
 
   return onSnapshot(
-    ledgerDocRef,
+    txCollectionRef,
     { includeMetadataChanges: true },
     (snapshot) => {
-      // Ignore local uncommitted writes to prevent feedback echo loops
-      if (snapshot.metadata.hasPendingWrites) {
-        return;
-      }
-      if (snapshot.exists()) {
-        const data = snapshot.data();
-        const payload: CloudLedgerPayload = {
-          expenses: Array.isArray(data.expenses) ? data.expenses : [],
-          incomes: Array.isArray(data.incomes) ? data.incomes : [],
-          budget: data.budget || {
-            daily: 500,
-            weekly: 3500,
-            monthly: 15000,
-            monthlySavingsTarget: 10000,
-            currency: '₹',
-          },
-          updatedAt: data.updatedAt || new Date().toISOString(),
-          lastDevice: data.lastDevice || 'Unknown',
-          accountEmail: data.accountEmail || accountEmail,
-        };
-        onUpdate(payload);
-      }
+      // Collect transactions from snapshot
+      const expList: Expense[] = [];
+      const incList: Income[] = [];
+
+      snapshot.forEach((docSnap) => {
+        const data = docSnap.data() as TransactionDoc;
+        if (!data || !data.id || !data.type) return;
+
+        const syncStatus = snapshot.metadata.hasPendingWrites ? 'pending_sync' : 'synced';
+
+        if (data.type === 'expense') {
+          expList.push({
+            ...transactionDocToExpense(data),
+            syncStatus,
+          });
+        } else if (data.type === 'income') {
+          incList.push({
+            ...transactionDocToIncome(data),
+            syncStatus,
+          });
+        }
+      });
+
+      // Sort descending by date, then createdAt
+      const sortFn = (a: { date: string; createdAt: number }, b: { date: string; createdAt: number }) => {
+        const dateComp = new Date(b.date).getTime() - new Date(a.date).getTime();
+        if (dateComp !== 0) return dateComp;
+        return (b.createdAt || 0) - (a.createdAt || 0);
+      };
+
+      expList.sort(sortFn);
+      incList.sort(sortFn);
+
+      onUpdate(expList, incList);
     },
     (error) => {
-      console.warn('Real-time account ledger subscription warning:', error);
+      console.warn('Real-time user transactions subscription error:', error);
       if (onError) onError(error);
       try {
-        handleFirestoreError(error, OperationType.GET, path);
+        handleFirestoreError(error, OperationType.LIST, collectionPath);
       } catch {}
     }
   );
 };
 
 /**
- * UNIFIED 1-EMAIL = 1-ACCOUNT STORE:
- * Saves the user's financial ledger directly to the central Firestore account store
- * so all computers and mobile devices accessing this email receive real-time sync.
+ * CANONICAL REAL-TIME SETTINGS SUBSCRIBER:
+ * Subscribes to users/{userId}/settings/budget and users/{userId}/settings/categories
  */
-export const saveAccountLedgerToCloud = async (
-  accountEmail: string,
-  data: {
-    expenses: Expense[];
-    incomes: Income[];
-    budget: BudgetConfig;
-  }
+export const subscribeToUserSettings = (
+  userId: string,
+  onBudgetUpdate: (budget: BudgetConfig) => void,
+  onCategoriesUpdate: (categories: Record<string, CategoryInfo>) => void,
+  onError?: (error: any) => void
+): (() => void) => {
+  const budgetRef = doc(db, 'users', userId, 'settings', 'budget');
+  const catRef = doc(db, 'users', userId, 'settings', 'categories');
+
+  const unsubBudget = onSnapshot(
+    budgetRef,
+    (snap) => {
+      if (snap.exists()) {
+        const data = snap.data();
+        onBudgetUpdate({
+          daily: data.daily ?? 500,
+          weekly: data.weekly ?? 3500,
+          monthly: data.monthly ?? 15000,
+          monthlySavingsTarget: data.monthlySavingsTarget ?? 10000,
+          currency: data.currency || '₹',
+          dateFormat: data.dateFormat || 'DD/MM/YYYY',
+          weekStartsOn: data.weekStartsOn || 'Monday',
+        });
+      }
+    },
+    (err) => {
+      if (onError) onError(err);
+    }
+  );
+
+  const unsubCat = onSnapshot(
+    catRef,
+    (snap) => {
+      if (snap.exists()) {
+        const data = snap.data();
+        if (data && data.custom && typeof data.custom === 'object') {
+          onCategoriesUpdate(data.custom);
+        }
+      }
+    },
+    (err) => {
+      if (onError) onError(err);
+    }
+  );
+
+  return () => {
+    unsubBudget();
+    unsubCat();
+  };
+};
+
+/**
+ * IDEMPOTENT TRANSACTION SAVE:
+ * Saves an individual transaction directly to users/{userId}/transactions/{transactionId}
+ */
+export const saveTransactionToCloud = async (
+  userId: string,
+  tx: TransactionDoc
 ): Promise<boolean> => {
-  if (!accountEmail) return false;
-  const accountKey = normalizeEmailAccountKey(accountEmail);
-  const path = `accounts/${accountKey}/ledger/current`;
+  if (!userId || !tx || !tx.id) return false;
+  const path = `users/${userId}/transactions/${tx.id}`;
 
   try {
-    const ledgerDocRef = doc(db, 'accounts', accountKey, 'ledger', 'current');
-    const nowStr = new Date().toISOString();
-    const platform = getDevicePlatform();
-
+    const docRef = doc(db, 'users', userId, 'transactions', tx.id);
     await setDoc(
-      ledgerDocRef,
+      docRef,
       {
-        accountEmail: accountEmail.trim().toLowerCase(),
-        expenses: data.expenses,
-        incomes: data.incomes,
-        budget: data.budget,
-        updatedAt: nowStr,
-        lastDevice: platform,
-        serverTime: serverTimestamp(),
+        ...tx,
+        userId,
+        updatedAt: Date.now(),
+        syncStatus: 'synced',
       },
       { merge: true }
     );
     return true;
   } catch (err: any) {
-    console.warn('Could not save ledger to central email account store:', err?.message || err);
+    console.warn(`Failed to save transaction ${tx.id} to cloud:`, err?.message || err);
     try {
       handleFirestoreError(err, OperationType.WRITE, path);
     } catch {}
@@ -185,119 +271,92 @@ export const saveAccountLedgerToCloud = async (
 };
 
 /**
- * Fetches the unified account ledger from Firestore once
+ * DELETES A TRANSACTION FROM CLOUD:
+ * Removes document from users/{userId}/transactions/{transactionId}
  */
-export const fetchAccountLedgerOnce = async (
-  accountEmail: string
-): Promise<CloudLedgerPayload | null> => {
-  if (!accountEmail) return null;
-  const accountKey = normalizeEmailAccountKey(accountEmail);
-  const path = `accounts/${accountKey}/ledger/current`;
+export const deleteTransactionFromCloud = async (
+  userId: string,
+  transactionId: string
+): Promise<boolean> => {
+  if (!userId || !transactionId) return false;
+  const path = `users/${userId}/transactions/${transactionId}`;
 
   try {
-    const ledgerDocRef = doc(db, 'accounts', accountKey, 'ledger', 'current');
-    const snap = await getDoc(ledgerDocRef);
-    if (snap.exists()) {
-      const data = snap.data();
-      return {
-        expenses: Array.isArray(data.expenses) ? data.expenses : [],
-        incomes: Array.isArray(data.incomes) ? data.incomes : [],
-        budget: data.budget,
-        updatedAt: data.updatedAt || new Date().toISOString(),
-        lastDevice: data.lastDevice,
-        accountEmail: data.accountEmail || accountEmail,
-      };
-    }
-    return null;
+    const docRef = doc(db, 'users', userId, 'transactions', transactionId);
+    await deleteDoc(docRef);
+    return true;
   } catch (err: any) {
-    console.warn('Failed to fetch account ledger once:', err?.message || err);
+    console.warn(`Failed to delete transaction ${transactionId} from cloud:`, err?.message || err);
     try {
-      handleFirestoreError(err, OperationType.GET, path);
+      handleFirestoreError(err, OperationType.DELETE, path);
     } catch {}
-    return null;
+    return false;
   }
 };
 
 /**
- * Subscribes to user UID ledger (backwards-compatibility)
+ * BATCH SAVE TRANSACTIONS:
+ * Safely batches multiple transactions to users/{userId}/transactions in chunks of 400
  */
-export const subscribeToUserLedger = (
+export const batchSaveTransactionsToCloud = async (
   userId: string,
-  onUpdate: (data: CloudLedgerPayload) => void,
-  onError?: (error: any) => void
-): Unsubscribe => {
-  const path = `users/${userId}/ledger/current`;
-  const ledgerDocRef = doc(db, 'users', userId, 'ledger', 'current');
+  transactions: TransactionDoc[]
+): Promise<boolean> => {
+  if (!userId || !transactions.length) return false;
 
-  return onSnapshot(
-    ledgerDocRef,
-    { includeMetadataChanges: true },
-    (snapshot) => {
-      if (snapshot.metadata.hasPendingWrites) {
-        return;
-      }
-      if (snapshot.exists()) {
-        const data = snapshot.data();
-        const payload: CloudLedgerPayload = {
-          expenses: Array.isArray(data.expenses) ? data.expenses : [],
-          incomes: Array.isArray(data.incomes) ? data.incomes : [],
-          budget: data.budget || {
-            daily: 500,
-            weekly: 3500,
-            monthly: 15000,
-            monthlySavingsTarget: 10000,
-            currency: '₹',
+  const CHUNK_SIZE = 400;
+  try {
+    for (let i = 0; i < transactions.length; i += CHUNK_SIZE) {
+      const chunk = transactions.slice(i, i + CHUNK_SIZE);
+      const batch = writeBatch(db);
+
+      chunk.forEach((tx) => {
+        const docRef = doc(db, 'users', userId, 'transactions', tx.id);
+        batch.set(
+          docRef,
+          {
+            ...tx,
+            userId,
+            updatedAt: Date.now(),
+            syncStatus: 'synced',
           },
-          updatedAt: data.updatedAt || new Date().toISOString(),
-          lastDevice: data.lastDevice || 'Unknown',
-        };
-        onUpdate(payload);
-      }
-    },
-    (error) => {
-      console.warn('Real-time ledger subscription warning:', error);
-      if (onError) onError(error);
-      try {
-        handleFirestoreError(error, OperationType.GET, path);
-      } catch {}
+          { merge: true }
+        );
+      });
+
+      await batch.commit();
     }
-  );
+    return true;
+  } catch (err: any) {
+    console.warn('Batch save transactions to cloud failed:', err?.message || err);
+    return false;
+  }
 };
 
 /**
- * Saves user UID ledger (backwards-compatibility)
+ * SAVES BUDGET CONFIG TO CLOUD:
+ * Writes to users/{userId}/settings/budget
  */
-export const saveUserLedgerToCloud = async (
+export const saveBudgetToCloud = async (
   userId: string,
-  data: {
-    expenses: Expense[];
-    incomes: Income[];
-    budget: BudgetConfig;
-  }
+  budget: BudgetConfig
 ): Promise<boolean> => {
   if (!userId) return false;
-  const path = `users/${userId}/ledger/current`;
+  const path = `users/${userId}/settings/budget`;
 
   try {
-    const ledgerDocRef = doc(db, 'users', userId, 'ledger', 'current');
-    const nowStr = new Date().toISOString();
-    const platform = getDevicePlatform();
-
+    const docRef = doc(db, 'users', userId, 'settings', 'budget');
     await setDoc(
-      ledgerDocRef,
+      docRef,
       {
-        expenses: data.expenses,
-        incomes: data.incomes,
-        budget: data.budget,
-        updatedAt: nowStr,
-        lastDevice: platform,
-        serverTime: serverTimestamp(),
+        ...budget,
+        updatedAt: Date.now(),
       },
       { merge: true }
     );
     return true;
   } catch (err: any) {
-    console.warn('Could not save ledger to Firestore cloud:', err?.message || err);
+    console.warn('Failed to save budget settings to cloud:', err?.message || err);
     try {
       handleFirestoreError(err, OperationType.WRITE, path);
     } catch {}
@@ -306,28 +365,75 @@ export const saveUserLedgerToCloud = async (
 };
 
 /**
- * Fetches user UID ledger once (backwards-compatibility)
+ * SAVES CATEGORIES CONFIG TO CLOUD:
+ * Writes to users/{userId}/settings/categories
  */
-export const fetchUserLedgerOnce = async (
-  userId: string
-): Promise<CloudLedgerPayload | null> => {
-  if (!userId) return null;
+export const saveCategoriesToCloud = async (
+  userId: string,
+  categories: Record<string, CategoryInfo>
+): Promise<boolean> => {
+  if (!userId) return false;
+  const path = `users/${userId}/settings/categories`;
+
   try {
-    const ledgerDocRef = doc(db, 'users', userId, 'ledger', 'current');
-    const snap = await getDoc(ledgerDocRef);
-    if (snap.exists()) {
-      const data = snap.data();
-      return {
-        expenses: Array.isArray(data.expenses) ? data.expenses : [],
-        incomes: Array.isArray(data.incomes) ? data.incomes : [],
-        budget: data.budget,
-        updatedAt: data.updatedAt || new Date().toISOString(),
-        lastDevice: data.lastDevice,
-      };
-    }
-    return null;
+    const docRef = doc(db, 'users', userId, 'settings', 'categories');
+    await setDoc(
+      docRef,
+      {
+        custom: categories,
+        updatedAt: Date.now(),
+      },
+      { merge: true }
+    );
+    return true;
   } catch (err: any) {
-    console.warn('Failed to fetch cloud ledger once:', err?.message || err);
-    return null;
+    console.warn('Failed to save categories to cloud:', err?.message || err);
+    try {
+      handleFirestoreError(err, OperationType.WRITE, path);
+    } catch {}
+    return false;
   }
+};
+
+/**
+ * BACKWARDS-COMPATIBILITY CHECK & MIGRATION:
+ * Checks if user has legacy data in users/{userId}/ledger/current or accounts/{email}/ledger/current
+ */
+export const fetchLegacyLedgerIfAny = async (
+  userId: string,
+  email?: string | null
+): Promise<{ expenses: Expense[]; incomes: Income[]; budget?: BudgetConfig } | null> => {
+  try {
+    // 1. Check users/{userId}/ledger/current
+    if (userId) {
+      const userLedgerRef = doc(db, 'users', userId, 'ledger', 'current');
+      const snap = await getDoc(userLedgerRef);
+      if (snap.exists()) {
+        const d = snap.data();
+        const exps = Array.isArray(d.expenses) ? d.expenses : [];
+        const incs = Array.isArray(d.incomes) ? d.incomes : [];
+        if (exps.length > 0 || incs.length > 0) {
+          return { expenses: exps, incomes: incs, budget: d.budget };
+        }
+      }
+    }
+
+    // 2. Check accounts/{email}/ledger/current
+    if (email && email.includes('@')) {
+      const accountKey = email.trim().toLowerCase().replace(/[\/\s]/g, '_');
+      const accountRef = doc(db, 'accounts', accountKey, 'ledger', 'current');
+      const snap = await getDoc(accountRef);
+      if (snap.exists()) {
+        const d = snap.data();
+        const exps = Array.isArray(d.expenses) ? d.expenses : [];
+        const incs = Array.isArray(d.incomes) ? d.incomes : [];
+        if (exps.length > 0 || incs.length > 0) {
+          return { expenses: exps, incomes: incs, budget: d.budget };
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Legacy ledger check notice:', err);
+  }
+  return null;
 };

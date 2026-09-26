@@ -2,7 +2,7 @@
   "entities": {
     "User": {
       "title": "User",
-      "description": "User account tracking and activity for usage analytics",
+      "description": "User account tracking, profile, and activity for canonical UID authentication",
       "type": "object",
       "properties": {
         "uid": { "type": "string" },
@@ -15,9 +15,46 @@
       },
       "required": ["uid", "firstSeenAt", "lastActiveAt"]
     },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "User-scoped financial transaction (income or expense) indexed by unique transactionId and owned by Firebase Auth UID",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "type": { "type": "string", "enum": ["expense", "income"] },
+        "amount": { "type": "number" },
+        "title": { "type": "string" },
+        "category": { "type": "string" },
+        "date": { "type": "string" },
+        "time": { "type": "string" },
+        "paymentMethod": { "type": "string" },
+        "notes": { "type": "string" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" },
+        "syncStatus": { "type": "string" }
+      },
+      "required": ["id", "userId", "type", "amount", "title", "category", "date", "createdAt"]
+    },
+    "UserSettings": {
+      "title": "UserSettings",
+      "description": "User-scoped financial settings including budget thresholds, currency, preferences, and custom categories",
+      "type": "object",
+      "properties": {
+        "daily": { "type": "number" },
+        "weekly": { "type": "number" },
+        "monthly": { "type": "number" },
+        "monthlySavingsTarget": { "type": "number" },
+        "currency": { "type": "string" },
+        "dateFormat": { "type": "string" },
+        "weekStartsOn": { "type": "string" },
+        "custom": { "type": "object" },
+        "updatedAt": { "type": "number" }
+      }
+    },
     "LedgerData": {
       "title": "LedgerData",
-      "description": "User's synchronized personal financial ledger (expenses, incomes, and budget settings) for cross-device real-time sync",
+      "description": "Legacy unified ledger document preserved for seamless zero-data-loss migration",
       "type": "object",
       "properties": {
         "expenses": { "type": "array" },
@@ -25,22 +62,29 @@
         "budget": { "type": "object" },
         "updatedAt": { "type": "string" },
         "lastDevice": { "type": "string" }
-      },
-      "required": ["updatedAt"]
+      }
     }
   },
   "firestore": {
     "/users/{userId}": {
       "schema": "User",
-      "description": "User activity document"
+      "description": "User profile document owned by Firebase Auth UID"
+    },
+    "/users/{userId}/transactions/{transactionId}": {
+      "schema": "Transaction",
+      "description": "Individual transaction documents owned by Firebase Auth UID providing real-time cross-device sync"
+    },
+    "/users/{userId}/settings/{settingId}": {
+      "schema": "UserSettings",
+      "description": "User configuration settings owned by Firebase Auth UID"
     },
     "/users/{userId}/ledger/{document}": {
       "schema": "LedgerData",
-      "description": "User's real-time financial ledger synchronizing across web and mobile"
+      "description": "Legacy user ledger document"
     },
     "/accounts/{accountKey}/ledger/{document}": {
       "schema": "LedgerData",
-      "description": "Unified 1-Email = 1-Account financial ledger synchronized across Computer Web and Mobile Web"
+      "description": "Legacy email account store preserved for backwards compatibility and migration"
     }
   }
 }

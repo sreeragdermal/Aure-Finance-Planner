@@ -55,6 +55,8 @@ export interface Expense {
   paymentMethod?: PaymentMethod;
   notes?: string;
   createdAt: number;
+  updatedAt?: number;
+  syncStatus?: 'synced' | 'pending_sync';
 }
 
 export interface Income {
@@ -67,6 +69,26 @@ export interface Income {
   paymentMethod?: PaymentMethod;
   notes?: string;
   createdAt: number;
+  updatedAt?: number;
+  syncStatus?: 'synced' | 'pending_sync';
+}
+
+export type TransactionType = 'expense' | 'income';
+
+export interface TransactionDoc {
+  id: string;
+  userId: string;
+  type: TransactionType;
+  amount: number;
+  title: string;
+  category: string;
+  date: string; // YYYY-MM-DD
+  time?: string;
+  paymentMethod?: PaymentMethod;
+  notes?: string;
+  createdAt: number;
+  updatedAt: number;
+  syncStatus?: 'synced' | 'pending_sync';
 }
 
 export interface BudgetConfig {

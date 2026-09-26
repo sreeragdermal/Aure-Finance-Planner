@@ -1,31 +1,46 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    // Default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    match /test/{document} {
+      allow read: if true;
+    }
+
+    // User profile and activity
     match /users/{userId} {
       allow create, update: if request.auth != null && request.auth.uid == userId;
       allow delete: if false;
-      // Private to owner / admin (Sreerag Dermal) and the user themselves
       allow read: if request.auth != null && (
         request.auth.uid == userId ||
         request.auth.token.email in ['sreeragdermal@gmail.com', 'Sreeragdermal@gmail.com']
       );
 
-      // Private cross-device real-time financial ledger
+      // Canonical user-scoped financial transactions (Income & Expense)
+      match /transactions/{transactionId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // Canonical user-scoped financial settings (Budget & Categories)
+      match /settings/{settingId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // Legacy user UID ledger
       match /ledger/{document} {
         allow read, write: if request.auth != null && request.auth.uid == userId;
       }
     }
 
-    // Unified 1-Email = 1-Account store: accessible across Computer and Mobile Web
+    // Legacy email account store preserved for backwards compatibility & zero-data-loss migration
     match /accounts/{accountKey} {
-      allow read, write: if true;
-      match /ledger/{document} {
-        allow read, write: if true;
+      allow read, write: if request.auth != null;
+      match /{sub=**} {
+        allow read, write: if request.auth != null;
       }
-    }
-
-    match /test/{document} {
-      allow read: if true;
     }
   }
 }
